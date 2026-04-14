@@ -2,18 +2,14 @@ import openmeteo_requests
 import pandas as pd
 import requests_cache
 from retry_requests import retry
-import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
+# --- 1. SETUP ---
 script_location = Path(__file__).resolve().parent
-
-
-
-cache_session = requests_cache.CachedSession('.cache', expire_after = 3600)
-retry_session = retry(cache_session, retries = 5, backoff_factor = 0.2)
-openmeteo = openmeteo_requests.Client(session = retry_session)
+cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+openmeteo = openmeteo_requests.Client(session=retry_session)
 
 locations = [
     {"name": "beijing", "lat": 40.0801, "lon": 116.5846},
@@ -65,100 +61,78 @@ locations = [
 
 model_list = ["gfs_seamless", "gem_seamless", "ecmwf_ifs", "gfs_hrrr", "icon_seamless"]
 
+MODEL_ID_MAP = {
+    30: "ecmwf_ifs",
+    2:  "gfs_seamless",
+    16: "gem_seamless",
+    20: "icon_seamless",
+    4:  "gfs_hrrr"
+}
 
-def validate_date(date_text):
-    try:
-        # This tells Python the expected format (YYYY-MM-DD)
-        # You can change '%Y-%m-%d' to '%m/%d/%Y' or whatever you need
-        datetime.strptime(date_text, '%Y-%m-%d')
-        return True
-    except ValueError:
-        print("Incorrect format, should be YYYY-MM-DD")
-        return False
-
+# --- 2. INPUT & VALIDATION ---
 while True:
     theDate = input("Enter date (YYYY-MM-DD): ")
-
-    if validate_date(theDate):
+    try:
+        datetime.strptime(theDate, '%Y-%m-%d')
         break
-    
-print(f"Validated Date: {theDate}")
+    except ValueError:
+        print("Incorrect format, should be YYYY-MM-DD")
 
+# --- 3. PROCESSING (ONE CITY AT A TIME) ---
 url = "https://api.open-meteo.com/v1/forecast"
-params = {
-    "latitude": [loc["lat"] for loc in locations],
-    "longitude": [loc["lon"] for loc in locations],
-    "daily": "temperature_2m_max",
-    "models": model_list,
-    "timezone": "auto",
-    "start_date": theDate,
-    "end_date": theDate,
-}
 
-print("Fetching data...")
-responses = openmeteo.weather_api(url, params = params)
-
-# 2. CORRECTED INTERNAL ID MAP
-# Based on your chart vs CSV alignment:
-MODEL_ID_MAP = {
-    30: "ecmwf_ifs",    # This is 21.3 (Matches your Green line)
-    2:  "gfs_seamless", # This is 20.1 (Matches your Blue line)
-    16: "gem_seamless", # Usually GEM or specialized ECMWF
-    20: "icon_seamless",
-    43: "gem_global"
-}
-
-# 3. PROCESSING
-total_responses = len(responses)
-num_cities = len(locations)
-responses_per_city = total_responses // num_cities
-
-current_idx = 0
 for loc in locations:
     city_name = loc['name']
-    merged_data = {}
+    print(f"\nProcessing: {city_name}...")
     
-    print(f"Merging models for: {city_name}...")
-    
-    for i in range(responses_per_city):
-        if current_idx >= total_responses:
-            break
-            
-        res = responses[current_idx]
-        current_idx += 1
-        
-        # Identify the model name
-        m_id = res.Model()
-        base_name = MODEL_ID_MAP.get(m_id, f"model_id_{m_id}")
-        
-        # SAFETY: If a city returns the same model name twice, don't overwrite
-        m_name = base_name
-        counter = 1
-        while m_name in merged_data:
-            m_name = f"{base_name}_{counter}"
-            counter += 1
+    params = {
+        "latitude": loc["lat"],
+        "longitude": loc["lon"],
+        "daily": "temperature_2m_max",
+        "models": model_list,
+        "timezone": "auto",
+        "start_date": theDate,
+        "end_date": theDate,
+    }
 
-        daily = res.Daily()
+    try:
+        # Fetching only for THIS city
+        responses = openmeteo.weather_api(url, params=params)
         
-        # Dates setup
-        if "date" not in merged_data:
-            merged_data["date"] = pd.date_range(
-                start = pd.to_datetime(daily.Time() + res.UtcOffsetSeconds(), unit = "s", utc = True),
-                end = pd.to_datetime(daily.TimeEnd() + res.UtcOffsetSeconds(), unit = "s", utc = True),
-                freq = pd.Timedelta(seconds = daily.Interval()),
-                inclusive = "left"
-            )
+        merged_data = {}
+        
+        for res in responses:
+            m_id = res.Model()
+            base_name = MODEL_ID_MAP.get(m_id, f"model_id_{m_id}")
             
-        merged_data[m_name] = daily.Variables(0).ValuesAsNumpy()
-    
-    BASE_DIR = script_location / "Data" / city_name / theDate
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    file_name = "model_runs"
-    # Save CSV
-    if merged_data:
-        df = pd.DataFrame(data=merged_data)
-        file_path = os.path.join(BASE_DIR, f"{file_name}_Report.csv")
-        df.to_csv(file_path, index=False)
-        print(f"Saved: {file_path}")
+            # Handle duplicate model names if they occur
+            m_name = base_name
+            counter = 1
+            while m_name in merged_data:
+                m_name = f"{base_name}_{counter}"
+                counter += 1
 
-print("\nDone! Columns now match the chart values.")
+            daily = res.Daily()
+            
+            # Setup Date column once
+            if "date" not in merged_data:
+                start_time = pd.to_datetime(daily.Time() + res.UtcOffsetSeconds(), unit="s", utc=True)
+                merged_data["date"] = [start_time.strftime('%Y-%m-%d')] # Keep it simple for CSV
+            
+            merged_data[m_name] = daily.Variables(0).ValuesAsNumpy()
+
+        # --- 4. SAVING TO YOUR HIERARCHICAL SYSTEM ---
+        # Data / city / YYYY-MM-DD / model_runs_Report.csv
+        save_path = script_location / "Data" / city_name / theDate
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        if merged_data:
+            df = pd.DataFrame(data=merged_data)
+            full_file_path = save_path / "model_runs_Report.csv"
+            df.to_csv(full_file_path, index=False)
+            print(f"✅ Saved successfully to {city_name}/{theDate}")
+
+    except Exception as e:
+        print(f"❌ Failed to fetch data for {city_name}: {e}")
+
+print("\nAll cities processed!")

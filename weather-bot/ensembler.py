@@ -3,23 +3,16 @@ from openmeteo_sdk.Variable import Variable
 import pandas as pd
 import requests_cache
 from retry_requests import retry
-import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
-
-
+# --- 1. SETUP ---
+# Anchoring the directory to where this script is saved
 script_location = Path(__file__).resolve().parent
+BASE_DIR = script_location / "Data"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Define your pre-existing folder name here
-# It will be located in the same directory as this .py file
-# BASE_DIR = script_location / "Data"
-
-# # Create BASE_DIR if it doesn't exist yet, just to be safe
-# BASE_DIR.mkdir(parents=True, exist_ok=True)
-
-# 1. Setup the API client
+# Setup the API client with cache and retry logic
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
@@ -72,66 +65,67 @@ locations = [
     {"name": "milan", "lat": 45.63, "lon": 8.7 }
 ]
 
-def validate_date(date_text):
-    try:
-        # This tells Python the expected format (YYYY-MM-DD)
-        # You can change '%Y-%m-%d' to '%m/%d/%Y' or whatever you need
-        datetime.strptime(date_text, '%Y-%m-%d')
-        return True
-    except ValueError:
-        print("Incorrect format, should be YYYY-MM-DD")
-        return False
-
+# --- 2. VALIDATION ---
 while True:
     theDate = input("Enter date (YYYY-MM-DD): ")
-
-    if validate_date(theDate):
+    try:
+        datetime.strptime(theDate, '%Y-%m-%d')
         break
+    except ValueError:
+        print("Incorrect format, should be YYYY-MM-DD")
+
+# --- 3. EXECUTION ---
 url = "https://ensemble-api.open-meteo.com/v1/ensemble"
-params = {
-    "latitude": [loc["lat"] for loc in locations],
-    "longitude": [loc["lon"] for loc in locations],
-    "daily": "temperature_2m_max",
-    "models": "ecmwf_ifs025_ensemble",
-    "timezone": "auto",
-    "start_date": theDate,
-    "end_date": theDate,
-}
 
-responses = openmeteo.weather_api(url, params=params)
-
-# 3. Process and Store Data
-for loc, response in zip(locations, responses):
+for loc in locations:
     city_name = loc['name']
-    
-    daily = response.Daily()
-    daily_variables = [daily.Variables(i) for i in range(daily.VariablesLength())]
-    
-    daily_temperature_2m_max = filter(
-        lambda x: x.Variable() == Variable.temperature and x.Altitude() == 2, 
-        daily_variables
-    )   
+    print(f"\nProcessing: {city_name}...")
 
-    daily_data = {"date": pd.date_range(
-        start = pd.to_datetime(daily.Time() + response.UtcOffsetSeconds(), unit = "s", utc = True),
-        end = pd.to_datetime(daily.TimeEnd() + response.UtcOffsetSeconds(), unit = "s", utc = True),
-        freq = pd.Timedelta(seconds = daily.Interval()),
-        inclusive = "left"
-    )}
+    params = {
+        "latitude": loc["lat"],
+        "longitude": loc["lon"],
+        "daily": "temperature_2m_max",
+        "models": "ecmwf_ifs025_ensemble",
+        "timezone": "auto",
+        "start_date": theDate,
+        "end_date": theDate,
+    }
 
-    for variable in daily_temperature_2m_max:
-        member = variable.EnsembleMember()
-        daily_data[f"temp_member_{member}"] = variable.ValuesAsNumpy()
+    try:
+        # Requesting data ONLY for this city
+        responses = openmeteo.weather_api(url, params=params)
+        response = responses[0] 
 
-    df = pd.DataFrame(data=daily_data)
+        daily = response.Daily()
+        daily_variables = [daily.Variables(i) for i in range(daily.VariablesLength())]
+        
+        # Filtering for temperature variables at 2m altitude
+        daily_temperature_2m_max = filter(
+            lambda x: x.Variable() == Variable.temperature and x.Altitude() == 2, 
+            daily_variables
+        )   
 
-    BASE_DIR = script_location / "Data" / city_name / theDate
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
+        # Preparing the data structure for Pandas
+        daily_data = {"date": [theDate]}
 
-    filename = "ensemble"
-    # 4. Save to your pre-existing directory
-    full_filename = f"{filename}_forecast.csv"
-    full_path = os.path.join(BASE_DIR, full_filename)
-    
-    df.to_csv(full_path, index=False)
-    print(f"Successfully saved {city_name} data to: {full_path}")
+        for variable in daily_temperature_2m_max:
+            member = variable.EnsembleMember()
+            daily_data[f"member_{member}"] = variable.ValuesAsNumpy()
+
+        # Create DataFrame
+        df = pd.DataFrame(data=daily_data)
+
+        # Building the Hierarchical Path: Data / city_name / date
+        target_path = BASE_DIR / city_name / theDate
+        target_path.mkdir(parents=True, exist_ok=True)
+
+        # Save to CSV
+        file_path = target_path / "ensemble_members_forecast.csv"
+        df.to_csv(file_path, index=False)
+        
+        print(f"✅ Success: {city_name} ensemble data saved.")
+
+    except Exception as e:
+        print(f"❌ Failed to fetch data for {city_name}: {e}")
+
+print("\n--- All city ensemble forecasts are organized and saved! ---")

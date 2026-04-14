@@ -59,7 +59,7 @@ def allcode(theDate, cities, city_name, folder_date_str):
 
     print(url)
     # Generate paths
-    filename = "market"
+    filename = "market.json"
     file_path = get_target_path(url, cities, filename, folder_date_str)
 
     # Ensure the city-specific subfolder exists inside BASE_DIRs
@@ -134,34 +134,3 @@ elif decision == 0:
 else :
     print("Undefined input")
 
-# url = f"https://gamma-api.polymarket.com/events/slug/highest-temperature-in-{city_name}-on-{theDate}"
-
-# print(url)
-# # Generate paths
-# filename = f"{theDate}"
-# file_path = get_target_path(url, cities, filename)
-
-# # Ensure the city-specific subfolder exists inside BASE_DIR
-# file_path.parent.mkdir(parents=True, exist_ok=True)
-
-# # Fetch and Save
-# getting_data(url, file_path)
-
-# print(f"Absolute Path Used: {file_path.resolve()}")
-
-# # --- 3. DATA PROCESSING ---
-# if file_path.exists():
-#     with open(file_path, "r") as f:
-#         data = json.load(f)
-
-#     market = data.get("markets", [])
-
-#     print("\n--- Market Results ---")
-#     for current_market in market:
-#         # We use .get() with fallbacks to avoid NoneType errors during printing
-#         title = current_market.get("groupItemTitle") or "General Market"
-#         prices = current_market.get("outcomePrices") or "[No Price Data]"
-        
-#         print(f"{title}: {prices}")
-# else:
-#     print("File was not created. Check your URL or permissions.")

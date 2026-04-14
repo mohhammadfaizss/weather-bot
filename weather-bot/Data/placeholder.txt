@@ -156,3 +156,82 @@
 # # first_market = market[0]
 
 # # print(first_market.get("outcomePrices"))
+
+import json
+import csv
+from pathlib import Path
+from datetime import datetime
+
+
+
+
+
+cities = [
+    "beijing", "london", "tokyo", "lucknow", "mexico-city", "nyc", 
+    "toronto", "chicago", "atlanta", "dallas", "denver", "san-francisco", 
+    "houston", "miami", "los-angeles", "austin", "seattle", "panama-city", 
+    "sao-paulo", "buenos-aires", "wellington", "jakarta", "seoul", 
+    "singapore", "hong-kong", "shanghai", "taipei", "kuala-lumpur", 
+    "chongqing", "chengdu", "busan", "cape-town", "lagos", "jeddah", 
+    "tel-aviv", "munich", "paris", "ankara", "istanbul", "moscow", 
+    "madrid", "helsinki", "amsterdam", "warsaw", "milan"
+]
+
+while(True):
+
+        city_name = input("Please enter city name : ")
+        if(city_name in cities):
+            break
+        else :
+            print("This city is not available. Try another city")
+
+while True:
+    theDate = input("Enter date (YYYY-MM-DD): ")
+    try:
+        datetime.strptime(theDate, '%Y-%m-%d')
+        break
+    except ValueError:
+        print("Incorrect format, should be YYYY-MM-DD")
+
+
+
+
+model_run_file_name = "model_runs_Report.csv"
+
+
+
+
+base_path = script_location / "Data"
+file_path = base_path / city_name / theDate / model_run_file_name 
+
+
+# with open(file_path, 'r') as file :
+#     modeldata = csv.DictReader(file)
+
+#     for row in modeldata :
+#         print(f"ecmwf_ifs : {row["ecmwf_ifs"]}")
+#         print(f"gfs_seamless : {row["gfs_seamless"]}")
+#         print(f"gem_seamless : {row["gem_seamless"]}")      
+#         print(f"gfs_hrrr : {row["gfs_hrrr"]}")
+#         print(f"icon_seamless : {row["icon_seamless"]}")
+
+
+with open(file_path, 'r', encoding='utf-8') as file:
+    modeldata = csv.DictReader(file)
+
+    models_to_track = [
+        "ecmwf_ifs", 
+        "gfs_seamless", 
+        "gem_seamless", 
+        "gfs_hrrr", 
+        "icon_seamless"
+    ]
+
+    for row in modeldata:
+        print(f"\n--- Data for {row.get('date', 'Unknown Date')} ---")
+        for model in models_to_track:
+            value = row.get(model)
+            if value and value.strip(): # Check if value exists and isn't just whitespace
+                print(f"{model}: {value}")
+        
+
