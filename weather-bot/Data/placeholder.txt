@@ -1,0 +1,158 @@
+# import requests
+
+# url = "https://gamma-api.polymarket.com/events/slug/cricipl-mum-kol-2026-03-29"
+
+# response = requests.get(url)
+
+# print(response.text)
+
+# import requests
+# import json
+
+# # Your Polymarket CLOB URL
+# url = "https://clob.polymarket.com/price?token_id=9243859686424154476031393325319635706552449918713151700199742912076304706244"
+
+# try:
+#     # 1. Fetch the data
+#     response = requests.get(url)
+#     response.raise_for_status() # Check for HTTP errors
+
+#     # 2. Convert response text to a Python Dictionary
+#     data = response.json()
+
+#     # 3. Save to a file with "Pretty Print" formatting
+#     with open("market_price.json", "w") as f:
+#         # indent=4 creates the newlines and tabs you want
+#         json.dump(data, f, indent=4)
+
+#     print("Success! Data stored in market_price.json")
+
+# except Exception as e:
+#     print(f"An error occurred: {e}")
+
+# import requests
+# import json
+# from pathlib import Path
+
+# # 1. The URL for the specific weather event
+# url = "https://gamma-api.polymarket.com/events/slug/highest-temperature-in-madrid-on-march-30-2026"
+
+
+# #finding the index of the data. We do this by finding the index of the last substring before our date
+
+
+# date_part = url.split("-on-")[-1]
+# filename = f"{date_part}.json"
+
+# cityName = ["singapore", "madrid"]
+# foundURl = (city for city in cityName if city in url)
+# FilePath = Path(foundURl) / filename
+
+
+
+
+
+# # 2. Fetch the data from Polymarket
+# response = requests.get(url)
+
+# # # # 3. Convert the raw text into a Python Dictionary (JSON object)
+# data = response.json()
+
+# # # # 4. Open a file and "dump" the dictionary into it
+# with open( FilePath , "w") as f:
+#     json.dump(data, f, indent=4)
+
+# print("Data successfully saved to " + f"{FilePath}")
+
+# # print(url[29:])
+
+
+# from pathlib import Path
+# import requests
+# import json
+
+# def get_file_name(url):
+#     date_part = url.split("-on-")[-1]
+#     filename = f"{date_part}.json"
+#     return filename
+
+
+
+# def get_target_path(url, cities, filename):
+#     """Finds a city match in a URL and returns a organized Path object."""
+#     url_lower = url.lower()
+    
+    
+#     folder_name = next((c for c in cities if c in url_lower), "unknown")
+    
+    
+#     return Path(folder_name) / filename
+
+# def getting_data(url, file_path, filename):
+#     response = requests.get(url)
+#     data = response.json()
+
+#     with open( file_path , "w") as f:
+#         json.dump(data, f, indent=4)
+
+# url = "https://gamma-api.polymarket.com/events/slug/highest-temperature-in-madrid-on-march-30-2026"
+# cities = ["singapore", "madrid", "london"]
+# filename = get_file_name(url)
+
+# file_path = get_target_path(url, cities, filename)
+
+# file_path.parent.mkdir(parents=True, exist_ok=True)
+
+# getting_data(url, file_path, filename)
+
+# print(f"Data saved to: {file_path}")
+
+# from pathlib import Path
+# import requests
+# import json
+
+# def get_file_name(url):
+#     date_part = url.split("-on-")[-1]
+#     return f"{date_part}.json"
+
+# def getting_data(url, file_path): # Removed unnecessary filename arg
+#     response = requests.get(url)
+#     data = response.json()
+    
+#     # Now this will work because the folder exists!
+#     with open(file_path, "w") as f:
+#         json.dump(data, f, indent=4)
+
+# def get_target_path(url, cities, filename):
+#     url_lower = url.lower()
+#     folder_name = next((c for c in cities if c in url_lower), "unknown")
+#     return Path(folder_name) / filename
+
+# # --- Execution ---
+# url = "https://gamma-api.polymarket.com/events/slug/highest-temperature-in-madrid-on-april-14-2026"
+# cities = ["singapore", "madrid", "london", "lucknow"]
+
+# filename = get_file_name(url)
+# file_path = get_target_path(url, cities, filename)
+
+# # STEP 1: Create the folder FIRST
+# file_path.parent.mkdir(parents=True, exist_ok=True)
+
+# # STEP 2: Now it is safe to fetch and save data
+# getting_data(url, file_path)
+
+# print(f"Data saved to: {file_path}")
+
+
+# with open(file_path, "r") as f:
+#     data = json.load(f)
+
+# market = data.get("markets", [])
+
+# for current_market in market:
+#     # Use the variable defined in the 'for' line
+#     print(current_market.get("groupItemTitle") +" " + current_market.get("outcomePrices"))
+
+# # first_market = market[0]
+
+# # print(first_market.get("outcomePrices"))

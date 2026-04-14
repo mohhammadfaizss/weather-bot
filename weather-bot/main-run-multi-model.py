@@ -9,12 +9,6 @@ from pathlib import Path
 
 script_location = Path(__file__).resolve().parent
 
-# Define your pre-existing folder name here
-# It will be located in the same directory as this .py file
-# BASE_DIR = script_location / "Data"
-
-# # Create BASE_DIR if it doesn't exist yet, just to be safe
-# BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 cache_session = requests_cache.CachedSession('.cache', expire_after = 3600)
