@@ -8,27 +8,16 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# ---------------------------------------------------------
-# CONFIGURATION: Set your pre-existing directory here
-# ---------------------------------------------------------
-# Ensure this folder already exists on your computer!
-# BASE_DIR = r"C:\Users\techn\Desktop\ALL code files\weather-bot\open-mateo\ensembler-weather-data"# BASE_DIR = "/home/user/weather_data"                    # For Linux/Mac
 
-# # Sanity Check: If the directory doesn't exist, stop the program
-# if not os.path.isdir(BASE_DIR):
-#     print(f"ERROR: The directory '{BASE_DIR}' does not exist.")
-#     print("Please create it manually before running this script.")
-#     sys.exit(1) 
-# # ---------------------------------------------------------
 
 script_location = Path(__file__).resolve().parent
 
 # Define your pre-existing folder name here
 # It will be located in the same directory as this .py file
-BASE_DIR = script_location / "ensembler-weather-data"
+# BASE_DIR = script_location / "Data"
 
-# Create BASE_DIR if it doesn't exist yet, just to be safe
-BASE_DIR.mkdir(parents=True, exist_ok=True)
+# # Create BASE_DIR if it doesn't exist yet, just to be safe
+# BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 1. Setup the API client
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -136,7 +125,10 @@ for loc, response in zip(locations, responses):
 
     df = pd.DataFrame(data=daily_data)
 
-    filename = city_name + "-" + theDate
+    BASE_DIR = script_location / "Data" / city_name / theDate
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename = "ensemble"
     # 4. Save to your pre-existing directory
     full_filename = f"{filename}_forecast.csv"
     full_path = os.path.join(BASE_DIR, full_filename)

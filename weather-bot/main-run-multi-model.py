@@ -11,10 +11,10 @@ script_location = Path(__file__).resolve().parent
 
 # Define your pre-existing folder name here
 # It will be located in the same directory as this .py file
-BASE_DIR = script_location / "main-run-multi-model-data"
+# BASE_DIR = script_location / "Data"
 
-# Create BASE_DIR if it doesn't exist yet, just to be safe
-BASE_DIR.mkdir(parents=True, exist_ok=True)
+# # Create BASE_DIR if it doesn't exist yet, just to be safe
+# BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 cache_session = requests_cache.CachedSession('.cache', expire_after = 3600)
@@ -156,8 +156,10 @@ for loc in locations:
             )
             
         merged_data[m_name] = daily.Variables(0).ValuesAsNumpy()
-        
-    file_name = city_name + "-" + theDate
+    
+    BASE_DIR = script_location / "Data" / city_name / theDate
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    file_name = "model_runs"
     # Save CSV
     if merged_data:
         df = pd.DataFrame(data=merged_data)
