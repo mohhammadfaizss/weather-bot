@@ -77,7 +77,16 @@ class Weather_Data_Collection:
             except ValueError:
                 print("Incorrect format, should be YYYY-MM-DD")
 
+    
+
     def ensemble_model(self):
+        MODEL_ID_MAP = {
+            2:  "ncep_gefs_seamless",
+            60: "ecmwf_ifs025_ensemble",
+            20: "icon_seamless_eps",
+            85: "ukmo_global_ensemble_20km"
+        }
+
         for loc in self.locations:
             city_name = loc['name']
             print(f"\nProcessing: {city_name}...")
@@ -87,48 +96,46 @@ class Weather_Data_Collection:
                 "latitude": loc["lat"],
                 "longitude": loc["lon"],
                 "daily": "temperature_2m_max",
-                "models": "ecmwf_ifs025_ensemble",
+                "models": ["ncep_gefs_seamless", "ecmwf_ifs025_ensemble", "icon_seamless_eps", "ukmo_global_ensemble_20km"],
                 "timezone": "auto",
                 "start_date": self.theDate,
                 "end_date": self.theDate,
             }
 
             try:
-                # Requesting data ONLY for this city
                 responses = openmeteo.weather_api(url, params=params)
-                response = responses[0] 
 
-                daily = response.Daily()
-                daily_variables = [daily.Variables(i) for i in range(daily.VariablesLength())]
-                
-                # Filtering for temperature variables at 2m altitude
-                daily_temperature_2m_max = filter(
-                    lambda x: x.Variable() == Variable.temperature and x.Altitude() == 2, 
-                    daily_variables
-                )   
+                for response in responses:
+                    m_id = response.Model()
+                    model_name = MODEL_ID_MAP.get(m_id, f"model_id_{m_id}")  # fallback if ID is unexpected
 
-                # Preparing the data structure for Pandas
-                daily_data = {"date": [self.theDate]}
+                    daily = response.Daily()
+                    daily_variables = [daily.Variables(i) for i in range(daily.VariablesLength())]
 
-                for variable in daily_temperature_2m_max:
-                    member = variable.EnsembleMember()
-                    daily_data[f"member_{member}"] = variable.ValuesAsNumpy()
+                    daily_temperature_2m_max = filter(
+                        lambda x: x.Variable() == Variable.temperature and x.Altitude() == 2,
+                        daily_variables
+                    )
 
-                # Create DataFrame
-                df = pd.DataFrame(data=daily_data)
+                    daily_data = {"date": [self.theDate]}
+                    for variable in daily_temperature_2m_max:
+                        member = variable.EnsembleMember()
+                        daily_data[f"member_{member}"] = variable.ValuesAsNumpy()
 
-                BASE_DIR = script_location / "Data"
-                BASE_DIR.mkdir(parents=True, exist_ok=True)
+                    df = pd.DataFrame(data=daily_data)
 
-                # Building the Hierarchical Path: Data / city_name / date
-                target_path = BASE_DIR / city_name / self.theDate
-                target_path.mkdir(parents=True, exist_ok=True)
+                    BASE_DIR = script_location / "Data"
+                    BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-                # Save to CSV
-                file_path = target_path / "ensemble_members_forecast.csv"
-                df.to_csv(file_path, index=False)
-                
-                print(f"✅ Success: {city_name} ensemble data saved.")
+                    ensemble_folder = "ensemble_data"
+                    target_path = BASE_DIR / city_name / self.theDate / ensemble_folder
+                    target_path.mkdir(parents=True, exist_ok=True)
+
+                    # ✅ Each model gets its own file
+                    file_path = target_path / f"{model_name}_ensemble.csv"
+                    df.to_csv(file_path, index=False)
+
+                    print(f"✅ Success: {city_name} — {model_name} saved.")
 
             except Exception as e:
                 print(f"❌ Failed to fetch data for {city_name}: {e}")
@@ -139,14 +146,16 @@ class Weather_Data_Collection:
             print(f"\nProcessing: {city_name}...")
             url = "https://api.open-meteo.com/v1/forecast"
             
-            model_list = ["gfs_seamless", "gem_seamless", "ecmwf_ifs", "gfs_hrrr", "icon_seamless"]
+            model_list = ["gfs_seamless", "gem_seamless", "ecmwf_ifs", "gfs_hrrr", "icon_seamless", "ukmo_seamless", "ecmwf_ifs025"]
 
             MODEL_ID_MAP = {
                 30: "ecmwf_ifs",
                 2:  "gfs_seamless",
                 16: "gem_seamless",
                 20: "icon_seamless",
-                4:  "gfs_hrrr"
+                4:  "gfs_hrrr",
+                82: "ukmo_seamless",
+                60: "ecmwf_ifs025"
             }
 
             params = {
