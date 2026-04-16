@@ -133,4 +133,3 @@ elif decision == 0:
 
 else :
     print("Undefined input")
-

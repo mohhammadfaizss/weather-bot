@@ -4,6 +4,7 @@ import pandas as pd
 import requests_cache
 from retry_requests import retry
 from datetime import datetime
+from datetime import time
 from pathlib import Path
 
 
@@ -138,7 +139,14 @@ class Weather_Data_Collection:
                     print(f"✅ Success: {city_name} — {model_name} saved.")
 
             except Exception as e:
-                print(f"❌ Failed to fetch data for {city_name}: {e}")
+                if "limit exceeded" in str(e).lower():
+                    print("Rate limit hit. Sleeping for 60 seconds...")
+                    time.sleep(60)
+                    # Optionally: try to request this city again here
+                else:
+                    print(f"❌ Failed to fetch data for {city_name}: {e}")
+
+            
 
     def main_run_multi_model(self):
         for loc in self.locations:
@@ -214,5 +222,3 @@ weather_data = Weather_Data_Collection()
 weather_data.date_input()
 weather_data.ensemble_model()
 weather_data.main_run_multi_model()
-
-

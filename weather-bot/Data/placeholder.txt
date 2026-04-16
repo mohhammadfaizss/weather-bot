@@ -423,3 +423,85 @@ with open(file_path, 'r', encoding='utf-8') as file:
 #         except Exception as e:
 #             print(f"❌ Failed to fetch data for {city_name}: {e}")
 
+ def process_model_runs(self, path , city_name ):
+    #     data = []
+    #     if not Path(path).exists():
+    #         print(f"Error: The file at {path} was not found.")
+    #         return
+        
+    #     print(f"\n\n\n\n========== {city_name} ==========")
+    #     with open(path, 'r', encoding='utf-8') as file:
+    #         modeldata = csv.DictReader(file)
+
+    #         for row in modeldata :
+    #             data.append(row)
+                
+    #         models_to_track = [
+    #             "ecmwf_ifs", 
+    #             "gfs_seamless", 
+    #             "gem_seamless", 
+    #             "gfs_hrrr", 
+    #             "icon_seamless"
+    #         ]
+
+    #         for row in modeldata:
+    #             print(f"\n--- Data for {row.get('date', 'Unknown Date')} ---")
+    #             for model in models_to_track:
+    #                 value = row.get(model)
+    #                 if value and value.strip(): # Check if value exists and isn't just whitespace
+    #                     print(f"{model}: {value}")
+            
+    #         jason_file_path = self.base_path / city_name / self.theDate / self.json_file_name
+
+    #         with open(jason_file_path, "w",  encoding='utf-8') as jsonf:
+    #             json.dump(data, jsonf, indent=4)
+
+    # def process_market_data(self, path , city_name):
+    #     if not Path(path).exists():
+    #         print(f"Error: The file at {path} was not found.")
+    #         return
+
+
+        
+    #     try:
+    #         with open(path, 'r') as file:
+    #             full_data = json.load(file)
+
+    #         markets_list = full_data.get("markets", [])
+
+    #         print(f"\n--- Market Results for {Path(path).parent.name} ---")
+            
+    #         if not markets_list:
+    #             print("No active markets found in this file.")
+    #             return
+    #         market_results_to_save = []
+
+    #         for current_market in markets_list:
+    #             market_info = {
+    #                 "title": current_market.get("groupItemTitle") or "General Market",
+    #                 "prices": current_market.get("outcomePrices") or "[No Price Data]",
+    #                 "description": current_market.get("description") or "No description"
+    #             }
+    #             print(f"{market_info['title']}: {market_info['prices']}")
+    #             market_results_to_save.append(market_info)
+
+    #         # --- MERGE INTO THE JSON FILE ---
+    #         json_file_path = self.base_path / city_name / self.theDate / self.json_file_name
+            
+    #         if json_file_path.exists():
+    #             # 1. Load the existing JSON (which has the CSV data)
+    #             with open(json_file_path, 'r', encoding='utf-8') as f:
+    #                 combined_data = json.load(f)
+                
+    #             # 2. Add the market data as a new key
+    #             combined_data["market_data"] = market_results_to_save
+                
+    #             # 3. Save it back
+    #             with open(json_file_path, 'w', encoding='utf-8') as f:
+    #                 json.dump(combined_data, f, indent=4)
+    #             print(f"✅ Market data merged into {self.json_file_name}")
+
+    #     except json.JSONDecodeError:
+    #         print("Error: The file is not a valid JSON.")
+    #     except Exception as e:
+    #         print(f"An unexpected error occurred: {e}")
