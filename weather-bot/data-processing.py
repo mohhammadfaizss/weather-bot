@@ -34,6 +34,8 @@ while True:
 script_location = Path(__file__).resolve().parent
 BASE_DIR = script_location / "Data" / theDate
 
+print(f"Script location: {script_location}")
+print(f"Base dir: {BASE_DIR}")
 
 market_path = BASE_DIR / f"market-{theDate}.csv"
 model_runs_path= BASE_DIR / f"model_runs_Report.csv"
