@@ -6,12 +6,12 @@ from retry_requests import retry
 from datetime import datetime
 from datetime import time
 from pathlib import Path
+import numpy as np
 
 
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
-
 # script location
 
 script_location = Path(__file__).resolve().parent
@@ -81,6 +81,7 @@ class Weather_Data_Collection:
     
 
     def ensemble_model(self):
+        all_rows = []
         MODEL_ID_MAP = {
             2:  "ncep_gefs_seamless",
             60: "ecmwf_ifs025_ensemble",
@@ -118,37 +119,43 @@ class Weather_Data_Collection:
                         daily_variables
                     )
 
-                    daily_data = {"date": [self.theDate]}
+                    daily_data = { "city": city_name, "model_name": model_name, "date": self.theDate}
                     for variable in daily_temperature_2m_max:
                         member = variable.EnsembleMember()
-                        daily_data[f"member_{member}"] = variable.ValuesAsNumpy()
+                        daily_data[f"member_{member}"] = variable.ValuesAsNumpy()[0]
 
-                    df = pd.DataFrame(data=daily_data)
-
-                    BASE_DIR = script_location / "Data"
-                    BASE_DIR.mkdir(parents=True, exist_ok=True)
-
-                    ensemble_folder = "ensemble_data"
-                    target_path = BASE_DIR / city_name / self.theDate / ensemble_folder
-                    target_path.mkdir(parents=True, exist_ok=True)
-
-                    # ✅ Each model gets its own file
-                    file_path = target_path / f"{model_name}_ensemble.csv"
-                    df.to_csv(file_path, index=False)
-
+                    all_rows.append(daily_data)
+                    
                     print(f"✅ Success: {city_name} — {model_name} saved.")
 
             except Exception as e:
                 if "limit exceeded" in str(e).lower():
                     print("Rate limit hit. Sleeping for 60 seconds...")
-                    time.sleep(60)
+                    time.sleep(2)
                     # Optionally: try to request this city again here
                 else:
                     print(f"❌ Failed to fetch data for {city_name}: {e}")
+        if all_rows:
+            df = pd.DataFrame(all_rows)
 
             
 
+            BASE_DIR = script_location / "Data"
+            BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+            target_path = BASE_DIR /  self.theDate 
+            target_path.mkdir(parents=True, exist_ok=True)
+
+            # ✅ Each model gets its own file
+            file_path = target_path / "ensemble-data.csv"
+            df.to_csv(file_path, index=False)
+
+            
+            
+
     def main_run_multi_model(self):
+        all_rows = []
+
         for loc in self.locations:
             city_name = loc['name']
             print(f"\nProcessing: {city_name}...")
@@ -177,44 +184,60 @@ class Weather_Data_Collection:
             }
 
             try:
-                # Fetching only for THIS city
                 responses = openmeteo.weather_api(url, params=params)
                 
-                merged_data = {}
+                # Dictionary for THIS specific city row
+                merged_data = {
+                    "city": city_name,
+                    "date": self.theDate
+                }
                 
                 for res in responses:
                     m_id = res.Model()
                     base_name = MODEL_ID_MAP.get(m_id, f"model_id_{m_id}")
                     
-                    # Handle duplicate model names if they occur
+                    # Handle duplicate model names
                     m_name = base_name
                     counter = 1
                     while m_name in merged_data:
                         m_name = f"{base_name}_{counter}"
                         counter += 1
 
-                    daily = res.Daily()
+                    daily = res.Daily() 
                     
-                    # Setup Date column once
-                    if "date" not in merged_data:
-                        start_time = pd.to_datetime(daily.Time() + res.UtcOffsetSeconds(), unit="s", utc=True)
-                        merged_data["date"] = [start_time.strftime('%Y-%m-%d')] # Keep it simple for CSV
-                    
-                    merged_data[m_name] = daily.Variables(0).ValuesAsNumpy()
+                    # --- SAFETY CHECK ---
+                    # Verify that the model actually returned data for this location
+                    if daily and daily.VariablesLength() > 0:
+                        # Extract the first value (since start/end date are the same)
+                        val = daily.Variables(0).ValuesAsNumpy()[0]
+                        merged_data[m_name] = val
+                    else:
+                        # If no data, fill with NaN (Not a Number) so calculations don't break
+                        print(f"⚠️ No data for model {m_name} at {city_name}")
+                        merged_data[m_name] = np.nan
 
-                # --- 4. SAVING TO YOUR HIERARCHICAL SYSTEM ---
-                # Data / city / YYYY-MM-DD / model_runs_Report.csv
-                save_path = script_location / "Data" / city_name / self.theDate
-                save_path.mkdir(parents=True, exist_ok=True)
-                
-                if merged_data:
-                    df = pd.DataFrame(data=merged_data)
-                    full_file_path = save_path / "model_runs_Report.csv"
-                    df.to_csv(full_file_path, index=False)
-                    print(f"✅ Saved successfully to {city_name}/{self.theDate}")
+                # Append this city's completed data to our global list
+                all_rows.append(merged_data)
 
             except Exception as e:
                 print(f"❌ Failed to fetch data for {city_name}: {e}")
+
+            # --- 2. FINAL SAVING (OUTSIDE THE LOOP) ---
+            # This runs after all cities are processed
+            if all_rows:
+                # Create the DataFrame from the collected list of rows
+                df = pd.DataFrame(all_rows)
+                
+                save_path = script_location / "Data" / self.theDate
+                save_path.mkdir(parents=True, exist_ok=True)
+                
+                full_file_path = save_path / "model_runs_Report.csv"
+                
+                # Save the final report containing all cities
+                df.to_csv(full_file_path, index=False)
+                print(f"\n✅ All cities processed. Final report saved to: {full_file_path}")
+            else:
+                print("❌ No data was collected.")
 
 
 

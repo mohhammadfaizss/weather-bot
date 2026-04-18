@@ -1,50 +1,10 @@
+import requests
+import pandas as pd
+import json
 from pathlib import Path
 from datetime import datetime
-import requests
-import json
+import time
 
-# --- 1. CONFIGURATION & DIRECTORY ANCHORING ---
-# This finds the folder where this script is actually saved
-script_location = Path(__file__).resolve().parent
-
-# Define your pre-existing folder name here
-# It will be located in the same directory as this .py file
-BASE_DIR = script_location / "Data"
-
-# Create BASE_DIR if it doesn't exist yet, just to be safe
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-
-# def get_file_name(url):
-#     """Extracts the date from the slug to create a filename."""
-#     try:
-#         date_part = url.split("-on-")[-1]
-#         return f"{date_part}.json"
-#     except IndexError:
-#         return "market_data_fallback.json"
-
-def getting_data(url, file_path):
-    """Fetches JSON data from the API and saves it to the specific path."""
-    print(f"Fetching data from Polymarket...")
-    response = requests.get(url)
-    
-    if response.status_code == 200:
-        data = response.json()
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=4)
-        print("Data successfully saved.")
-    else:
-        print(f"Failed to fetch data. Status code: {response.status_code}")
-
-def get_target_path(url, cities, filename, folder_date_str):
-    """Determines the folder structure inside BASE_DIR based on the city."""
-    url_lower = url.lower()
-    # Matches the city from the list or defaults to 'unknown'
-    folder_name = next((c for c in cities if c in url_lower), "unknown")
-    
-    # Path logic: BASE_DIR / city_folder / filename.json
-    return BASE_DIR / folder_name / folder_date_str /filename
-
-# validates weather the date is in correct format or not
 
 def validate_date(date_text):
     try:
@@ -53,41 +13,27 @@ def validate_date(date_text):
     except ValueError:
         print("Incorrect format, should be YYYY-MM-DD")
         return None # Return None instead of False
-    
-def allcode(theDate, cities, city_name, folder_date_str):
-    url = f"https://gamma-api.polymarket.com/events/slug/highest-temperature-in-{city_name}-on-{theDate}"
 
-    print(url)
-    # Generate paths
-    filename = "market.json"
-    file_path = get_target_path(url, cities, filename, folder_date_str)
+while True:
+    raw_input = input("Enter date (YYYY-MM-DD): ")
+    date_obj = validate_date(raw_input)
 
-    # Ensure the city-specific subfolder exists inside BASE_DIRs
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if date_obj: # If it's not None, the date is valid
+        break
 
-    # Fetch and Save
-    getting_data(url, file_path)
+theDate = date_obj.strftime("%Y-%m-%d")
+folder_str = date_obj.strftime("%B-%d-%Y").lower()
 
-    print(f"Absolute Path Used: {file_path.resolve()}")
+print(theDate)
+print(folder_str)
 
-    # --- 3. DATA PROCESSING ---
-    if file_path.exists():
-        with open(file_path, "r") as f:
-            data = json.load(f)
+script_location = Path(__file__).resolve().parent
+BASE_DIR = script_location / "Data" / theDate 
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-    market = data.get("markets", [])
+file_dir = BASE_DIR / f"market-{theDate}.csv"
 
-    # print("\n--- Market Results ---")
-    # for current_market in market:
-    #     # We use .get() with fallbacks to avoid NoneType errors during printing
-    #     title = current_market.get("groupItemTitle") or "General Market"
-    #     prices = current_market.get("outcomePrices") or "[No Price Data]"
-        
-    #     print(f"{title}: {prices}")
-    # else:
-    #     print("File was not created. Check your URL or permissions.")
 
-# --- 2. EXECUTION ---
 cities = [
     "beijing", "london", "tokyo", "lucknow", "mexico-city", "nyc", 
     "toronto", "chicago", "atlanta", "dallas", "denver", "san-francisco", 
@@ -99,37 +45,59 @@ cities = [
     "madrid", "helsinki", "amsterdam", "warsaw", "milan"
 ]
 
-#45
 
 
 
-while True:
-    raw_input = input("Enter date (YYYY-MM-DD): ")
-    date_obj = validate_date(raw_input)
 
-    if date_obj: # If it's not None, the date is valid
-        break
+each_market_data = []
+for city_name in cities :
+    url = f"https://gamma-api.polymarket.com/events/slug/highest-temperature-in-{city_name}-on-{folder_str}"
 
-folder_date_str = date_obj.strftime("%Y-%m-%d")
-theDate = date_obj.strftime("%B-%d-%Y").lower()
 
-decision = int(input("Enter 1 or True : if you want data of specific city\nEnter 0 or False : if you want data of all the cities :\n"))
+    try:
+        response = requests.get(url, timeout=10)  # ✅ Fail after 10 seconds
+        response.raise_for_status()               # ✅ Catch 4xx/5xx errors
+        data = response.json()
+    except requests.exceptions.Timeout:
+        print(f"⏱️ Timeout for {city_name}, skipping...")
+        continue
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ HTTP error for {city_name}: {e.response.status_code}")
+        continue
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Request failed for {city_name}: {e}")
+        continue
 
-if decision == 1 :
-    while(True):
 
-        city_name = input("Please enter city name : ")
-        if(city_name in cities):
-            break
-        else :
-            print("This city is not available. Try another city")
+    market = data.get("markets", [])
+   
     
-    allcode(theDate, cities, city_name, folder_date_str)
+    
+    for mark in market:
+
+        item = mark
+        # yesprice = mark.get("outcomePrices[0]")
+        # noprice = mark.get("outcomePrices[1]")
+        entry = {       
+                        "date" : theDate,
+                        "city" : city_name,
+                        "title": item.get("groupItemTitle") or "General Market",
+                        "prices": item.get("outcomePrices") or "[No Price Data]",
+                        "question": item.get("question") or "No question",
+                        "resolutionSource": item.get("resolutionSource") or "No resolution source"
+                    }
+        each_market_data.append(entry)
+        time.sleep(0.5)
+    print(f"Data of {city_name} has been saved")
+        
+
+df = pd.DataFrame(each_market_data)
 
 
-elif decision == 0:
-    for city_name in cities:
-        allcode(theDate, cities, city_name, folder_date_str)
+df.to_csv(file_dir, index=False)
 
-else :
-    print("Undefined input")
+
+
+
+
+
