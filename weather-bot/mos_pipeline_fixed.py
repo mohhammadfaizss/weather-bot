@@ -35,6 +35,7 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 import warnings
 from pathlib import Path
+from variable import cities
 
 try:
     import pytz
@@ -877,16 +878,74 @@ def run_pipeline(
 if __name__ == "__main__":
 
     # Lucknow
+#     cities = [
+#     {"name": "beijing", "station": "ZBAA", "timezone": "Asia/Shanghai"},
+#     {"name": "london", "station": "EGLC", "timezone": "Europe/London"},
+#     {"name": "tokyo", "station": "RJTT", "timezone": "Asia/Tokyo"},
+#     {"name": "lucknow", "station": "VILK", "timezone": "Asia/Kolkata"},
+#     {"name": "mexico-city", "station": "MMMX", "timezone": "America/Mexico_City"},
+#     {"name": "nyc", "station": "LGA", "timezone": "America/New_York"},
+#     {"name": "toronto", "station": "CYYZ", "timezone": "America/Toronto"},
+#     {"name": "chicago", "station": "ORD", "timezone": "America/Chicago"},
+#     {"name": "atlanta", "station": "ATL", "timezone": "America/New_York"},
+#     {"name": "dallas", "station": "DAL", "timezone": "America/Chicago"},
+#     {"name": "denver", "station": "BKF", "timezone": "America/Denver"},
+#     {"name": "san-francisco", "station": "SFO", "timezone": "America/Los_Angeles"},
+#     {"name": "houston", "station": "HOU", "timezone": "America/Chicago"},
+#     {"name": "miami", "station": "MIA", "timezone": "America/New_York"},
+#     {"name": "los-angeles", "station": "LAX", "timezone": "America/Los_Angeles"},
+#     {"name": "austin", "station": "AUS", "timezone": "America/Chicago"},
+#     {"name": "seattle", "station": "SEA", "timezone": "America/Los_Angeles"},
+#     {"name": "panama-city", "station": "MPMG", "timezone": "America/Panama"},
+#     {"name": "sao-paulo", "station": "SBGR", "timezone": "America/Sao_Paulo"},
+#     {"name": "buenos-aires", "station": "SAEZ", "timezone": "America/Argentina/Buenos_Aires"},
+#     {"name": "wellington", "station": "NZWN", "timezone": "Pacific/Auckland"},
+#     {"name": "jakarta", "station": "WIHH", "timezone": "Asia/Jakarta"},
+#     {"name": "seoul", "station": "RKSI", "timezone": "Asia/Seoul"},
+#     {"name": "singapore", "station": "WSSS", "timezone": "Asia/Singapore"},
+#     {"name": "hong-kong", "station": "VHHH", "timezone": "Asia/Hong_Kong"},
+#     {"name": "shanghai", "station": "ZSPD", "timezone": "Asia/Shanghai"},
+#     {"name": "taipei", "station": "RCSS", "timezone": "Asia/Taipei"},
+#     {"name": "kuala-lumpur", "station": "WMKK", "timezone": "Asia/Kuala_Lumpur"},
+#     {"name": "chongqing", "station": "ZUCK", "timezone": "Asia/Shanghai"},
+#     {"name": "chengdu", "station": "ZUUU", "timezone": "Asia/Shanghai"},
+#     {"name": "busan", "station": "RKPK", "timezone": "Asia/Seoul"},
+#     {"name": "cape-town", "station": "FACT", "timezone": "Africa/Johannesburg"},
+#     {"name": "lagos", "station": "DNMM", "timezone": "Africa/Lagos"},
+#     {"name": "jeddah", "station": "OEJN", "timezone": "Asia/Riyadh"},
+#     {"name": "tel-aviv", "station": "LLBG", "timezone": "Asia/Jerusalem"},
+#     {"name": "munich", "station": "EDDM", "timezone": "Europe/Berlin"},
+#     {"name": "paris", "station": "LFPB", "timezone": "Europe/Paris"},
+#     {"name": "ankara", "station": "LTAC", "timezone": "Europe/Istanbul"},
+#     {"name": "istanbul", "station": "LTFM", "timezone": "Europe/Istanbul"},
+#     {"name": "moscow", "station": "UUEE", "timezone": "Europe/Moscow"},
+#     {"name": "madrid", "station": "LEMD", "timezone": "Europe/Madrid"},
+#     {"name": "helsinki", "station": "EFHK", "timezone": "Europe/Helsinki"},
+#     {"name": "amsterdam", "station": "EHAM", "timezone": "Europe/Amsterdam"},
+#     {"name": "warsaw", "station": "EPWA", "timezone": "Europe/Warsaw"},
+#     {"name": "milan", "station": "LIMC", "timezone": "Europe/Rome"}
+# ]
+    all_city_names = [c["name"] for c in cities]
+
+    while True:
+        city_name = input("Enter city name: ").strip().lower()
+        selected_city = next((c for c in cities if c["name"] == city_name), None)
+        if city_name in all_city_names:
+            print(f"{city_name} found!")
+            break
+        else:
+            print("City not found. Please try again.")
+
     result = run_pipeline(
-        station             = "SBGR",
-        city                = "Sao-Paulo",
-        timezone            = "America/Sao_Paulo",
+        station             = selected_city["station"],
+        city                = selected_city["name"],
+        timezone            = selected_city["timezone"],
         data_folder         = "mos_data",
-        buckets             = [24,25,26,27,28,29,30,31],
+        buckets             = [20,21,22,23,24,25,26,27,28,29,30,31],
         market_prices       = None,
         initial_train_days  = 1400,
         run_walk_forward    = False,   # set True for full diagnostic (slow)
-        corrector_seed_days = 30,      # increase to 30 for more stable seeding
+        corrector_seed_days = 14,      # increase to 30 for more stable seeding
     )
 
     # Madrid
@@ -901,3 +960,4 @@ if __name__ == "__main__":
     #     run_walk_forward    = False,
     #     corrector_seed_days = 14,
     # )
+

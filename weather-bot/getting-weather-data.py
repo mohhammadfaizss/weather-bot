@@ -7,7 +7,7 @@ from datetime import datetime
 from datetime import time
 from pathlib import Path
 import numpy as np
-
+from variable import *
 
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
@@ -20,53 +20,6 @@ script_location = Path(__file__).resolve().parent
 
 class Weather_Data_Collection:
     
-    locations = [
-        {"name": "beijing", "lat": 40.0801, "lon": 116.5846},
-        {"name": "london", "lat": 51.5085, "lon": -0.1257},
-        {"name": "tokyo", "lat": 35.6895, "lon": 139.6917},
-        {"name": "lucknow", "lat": 26.74, "lon": 80.86},
-        {"name": "mexico-city", "lat": 19.44 , "lon": -99.08 },
-        {"name": "nyc", "lat": 40.76, "lon": -73.86},
-        {"name": "toronto", "lat": 43.71 , "lon": -79.66},
-        {"name": "chicago", "lat": 41.98, "lon": -87.91},
-        {"name": "atlanta", "lat": 33.64, "lon": -84.41},
-        {"name": "dallas", "lat": 32.85, "lon": -96.87},
-        {"name": "denver", "lat": 39.7, "lon": -104.76},
-        {"name": "san-francisco", "lat": 37.62, "lon": -122.39},
-        {"name": "houston", "lat": 29.63, "lon": -95.25},
-        {"name": "miami", "lat": 25.85 , "lon": -80.24},
-        {"name": "los-angeles", "lat": 33.96, "lon": -118.4},
-        {"name": "austin", "lat": 30.16, "lon": -97.69},
-        {"name": "seattle", "lat": 47.44, "lon": -122.3},
-        {"name": "panama-city", "lat": 8.98, "lon": 79.56 },
-        {"name": "sao-paulo", "lat": -23.42 , "lon": -46.48},
-        {"name": "buenos-aires", "lat": -34.79 , "lon": -58.52},
-        {"name": "wellington", "lat": -41.32, "lon": 174.8},
-        {"name": "jakarta", "lat": -6.26, "lon": 106.89},
-        {"name": "seoul", "lat": 37.49, "lon": 126.49},
-        {"name": "singapore", "lat": 1.35, "lon": 104},
-        {"name": "hong-kong", "lat": 22.2783, "lon": 114.1747},
-        {"name": "shanghai", "lat": 31.15 , "lon": 121.8 },
-        {"name": "taipei", "lat": 25.06, "lon": 121.55},
-        {"name": "kuala-lumpur", "lat": 2.77, "lon": 101.7},
-        {"name": "chongqing", "lat": 29.72 , "lon": 106.63},
-        {"name": "chengdu", "lat": 30.57 , "lon": 103.96 },
-        {"name": "busan", "lat": 35.18  , "lon": 128.95},
-        {"name": "cape-town", "lat": -33.97, "lon": 18.59},
-        {"name": "lagos", "lat": 6.45 , "lon": 3.39 },
-        {"name": "jeddah", "lat": 21.58 , "lon": 39.16},
-        {"name": "tel-aviv", "lat": 32.0809, "lon": 34.7806},
-        {"name": "munich", "lat": 48.35  , "lon": 11.79 },
-        {"name": "paris", "lat": 49.02  , "lon": 2.59  },
-        {"name": "ankara", "lat": 40.24   , "lon": 33.03},
-        {"name": "istanbul", "lat": 41.0138  , "lon": 28.9497 },
-        {"name": "moscow", "lat": 55.7522  , "lon": 37.6156  },
-        {"name": "madrid", "lat": 40.45 , "lon": -3.58 },
-        {"name": "helsinki", "lat": 60.32   , "lon": 24.97},
-        {"name": "amsterdam", "lat": 52.31  , "lon": 4.76},
-        {"name": "warsaw", "lat": 52.17  , "lon": 20.98},
-        {"name": "milan", "lat": 45.63, "lon": 8.7 }
-        ]
 
         
     def date_input(self):
@@ -89,7 +42,7 @@ class Weather_Data_Collection:
             85: "ukmo_global_ensemble_20km"
         }
 
-        for loc in self.locations:
+        for loc in cities:
             city_name = loc['name']
             print(f"\nProcessing: {city_name}...")
             url = "https://ensemble-api.open-meteo.com/v1/ensemble"
@@ -131,7 +84,7 @@ class Weather_Data_Collection:
             except Exception as e:
                 if "limit exceeded" in str(e).lower():
                     print("Rate limit hit. Sleeping for 60 seconds...")
-                    time.sleep(2)
+                    time.sleep(60)
                     # Optionally: try to request this city again here
                 else:
                     print(f"❌ Failed to fetch data for {city_name}: {e}")
@@ -156,28 +109,20 @@ class Weather_Data_Collection:
     def main_run_multi_model(self):
         all_rows = []
 
-        for loc in self.locations:
+        for loc in cities:
             city_name = loc['name']
             print(f"\nProcessing: {city_name}...")
             url = "https://api.open-meteo.com/v1/forecast"
             
-            model_list = ["gfs_seamless", "gem_seamless", "ecmwf_ifs", "gfs_hrrr", "icon_seamless", "ukmo_seamless", "ecmwf_ifs025"]
+            
 
-            MODEL_ID_MAP = {
-                30: "ecmwf_ifs",
-                2:  "gfs_seamless",
-                16: "gem_seamless",
-                20: "icon_seamless",
-                4:  "gfs_hrrr",
-                82: "ukmo_seamless",
-                60: "ecmwf_ifs025"
-            }
+            
 
             params = {
                 "latitude": loc["lat"],
                 "longitude": loc["lon"],
                 "daily": "temperature_2m_max",
-                "models": model_list,
+                "models": MODELS,
                 "timezone": "auto",
                 "start_date": self.theDate,
                 "end_date": self.theDate,
@@ -243,5 +188,5 @@ class Weather_Data_Collection:
 
 weather_data = Weather_Data_Collection()
 weather_data.date_input()
-weather_data.ensemble_model()
+# weather_data.ensemble_model()
 weather_data.main_run_multi_model()

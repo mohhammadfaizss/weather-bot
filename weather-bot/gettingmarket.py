@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 import time
+from variable import *
 
 
 def validate_date(date_text):
@@ -34,25 +35,16 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 file_dir = BASE_DIR / f"market-{theDate}.csv"
 
 
-cities = [
-    "beijing", "london", "tokyo", "lucknow", "mexico-city", "nyc", 
-    "toronto", "chicago", "atlanta", "dallas", "denver", "san-francisco", 
-    "houston", "miami", "los-angeles", "austin", "seattle", "panama-city", 
-    "sao-paulo", "buenos-aires", "wellington", "jakarta", "seoul", 
-    "singapore", "hong-kong", "shanghai", "taipei", "kuala-lumpur", 
-    "chongqing", "chengdu", "busan", "cape-town", "lagos", "jeddah", 
-    "tel-aviv", "munich", "paris", "ankara", "istanbul", "moscow", 
-    "madrid", "helsinki", "amsterdam", "warsaw", "milan"
-]
-
-
 
 
 
 each_market_data = []
-for city_name in cities :
+for loc in cities :
+
+    city_name = loc['name']
     url = f"https://gamma-api.polymarket.com/events/slug/highest-temperature-in-{city_name}-on-{folder_str}"
 
+    
 
     try:
         response = requests.get(url, timeout=10)  # ✅ Fail after 10 seconds
@@ -87,7 +79,7 @@ for city_name in cities :
                         "resolutionSource": item.get("resolutionSource") or "No resolution source"
                     }
         each_market_data.append(entry)
-        time.sleep(0.5)
+        # time.sleep(0.5)
     print(f"Data of {city_name} has been saved")
         
 
