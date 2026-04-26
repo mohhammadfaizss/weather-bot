@@ -65,11 +65,16 @@ ensemble_data = pd.read_csv(ensemble_data_path)
 
 ensemble_data_filtered = ensemble_data[ensemble_data["city"] == city_name]
 
+printvar = "\n  ──────────────────────────────────────────────\n"
 # data_without_question
+print(f"\n  ──────────────────────────────────────────────\n")
 print(market_data_filtered)
+print(f"\n  ──────────────────────────────────────────────\n")
+
+print(f"\n  ──────────────────────────────────────────────\n")
 print(model_runs_data_filtered)
 # print(ensemble_data_filtered)
-
+print(f"\n  ──────────────────────────────────────────────\n")
 
 
 ensemble_data_filtered['mean']   = ensemble_data_filtered.filter(like='member_').mean(axis=1)
@@ -81,11 +86,14 @@ ensemble_data_filtered['p75']    = ensemble_data_filtered.filter(like='member_')
 ensemble_data_filtered['p90']    = ensemble_data_filtered.filter(like='member_').quantile(0.90, axis=1)
 
 ensemble_data_filtered = ensemble_data_filtered.set_index('model_name')
+print(f"\n  ──────────────────────────────────────────────\n")
+print(f"{ensemble_data_filtered['mean']} \n {printvar} {ensemble_data_filtered['median']} \n {printvar}  {ensemble_data_filtered['std']}")
+print(f"\n  ──────────────────────────────────────────────\n")
+# print(ensemble_data_filtered['median'])
+# print(ensemble_data_filtered['std'])
+print(f"{ensemble_data_filtered['p10']} \n {printvar}  {ensemble_data_filtered['p25']}")
+print(f"\n  ──────────────────────────────────────────────\n")
+# print(ensemble_data_filtered['p25'])
+print(f"{ensemble_data_filtered['p75']} \n {printvar}  {ensemble_data_filtered['p90']}")
 
-print(ensemble_data_filtered['mean'])
-print(ensemble_data_filtered['median'])
-print(ensemble_data_filtered['std'])
-print(ensemble_data_filtered['p10'])
-print(ensemble_data_filtered['p25'])
-print(ensemble_data_filtered['p75'])
-print(ensemble_data_filtered['p90'])
+# print(ensemble_data_filtered['p90'])

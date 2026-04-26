@@ -7,6 +7,7 @@ import time
 from variable import *
 
 
+
 def validate_date(date_text):
     try:
         # We return the actual datetime object if it's valid

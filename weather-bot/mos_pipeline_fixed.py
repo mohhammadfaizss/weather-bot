@@ -27,6 +27,8 @@ Always pass an IANA string  e.g. "Asia/Kolkata", "Europe/Madrid"
 Never pass a fixed offset — it silently breaks DST cities.
 """
 
+from datetime import date
+import datetime
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import Ridge
@@ -57,7 +59,7 @@ MODELS = [
     "ukmo_seamless",
 ]
 
-SKY_MAP = {"NSC": 0, "FEW": 20, "SCT": 45, "BKN": 75, "OVC": 100}
+SKY_MAP = {"NSC": 0, "FEW": 20, "SCT": 45, "BKN": 75, "OVC": 100 , "NCD": 0}
 
 
 # =============================================================================
@@ -224,7 +226,13 @@ class RealtimeBiasCorrector:
             f"base correction: {base:+.2f}C",
         ]
         if jump is not None:
-            damp_pct = 100 * (1 - abs(damped) / abs(base)) if base != 0 else 0
+            # Clamp to [0, 100] — if correction crosses zero due to floating
+            # point the raw formula overshoots and produces negative or >100%
+            # values which are confusing in the output.
+            if base != 0:
+                damp_pct = max(0, min(100, 100 * (1 - abs(damped) / abs(base))))
+            else:
+                damp_pct = 0
             parts.append(f"forecast jump: {jump:.1f}C  "
                          f"dampening: {damp_pct:.0f}%  "
                          f"final: {damped:+.2f}C")
@@ -248,6 +256,76 @@ class RealtimeBiasCorrector:
 
 
 # =============================================================================
+# CORRECTOR PERSISTENCE
+# =============================================================================
+
+def corrector_state_path(city: str, data_folder: str = "mos_data") -> Path:
+    """Path to the JSON file that persists the corrector state between runs."""
+    script_dir = Path(__file__).resolve().parent
+    return script_dir / data_folder / f"corrector_{city.lower()}.json"
+
+
+def save_corrector(corrector: RealtimeBiasCorrector,
+                   city: str, data_folder: str = "mos_data") -> None:
+    """
+    Persist corrector state to disk after each run.
+    Call this AFTER observing the actual tmax and calling corrector.update().
+    In practice: call it at the end of run_pipeline so the next run picks up
+    the real error from today's forecast.
+    """
+    import json
+    path = corrector_state_path(city, data_folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(corrector.state(), f, default=str)
+    print(f"  [CORRECTOR] State saved -> {path.name}")
+
+
+def load_corrector(city: str, data_folder: str = "mos_data",
+                   decay: float = 0.7,
+                   jump_scale: float = 2.0) -> "RealtimeBiasCorrector | None":
+    """
+    Load persisted corrector state from disk.
+    Returns None if no saved state exists (first ever run).
+    """
+    import json
+    path = corrector_state_path(city, data_folder)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        state = json.load(f)
+    corr = RealtimeBiasCorrector.from_state(state)
+    print(f"  [CORRECTOR] Loaded saved state from {path.name}  "
+          f"({corr.n_days()} days of real errors)")
+    return corr
+
+
+def update_and_save_corrector(corrector: RealtimeBiasCorrector,
+                               forecast_date: str,
+                               ml_prediction: float,
+                               actual_tmax: float,
+                               city: str,
+                               data_folder: str = "mos_data") -> None:
+    """
+    After you observe the real tmax for a forecast day, call this to:
+      1. Record the real error into the corrector
+      2. Save the updated state to disk
+
+    Parameters
+    ----------
+    forecast_date  : The date that was being predicted (YYYY-MM-DD)
+    ml_prediction  : The ml_forecast value from that day's run_pipeline output
+    actual_tmax    : The real observed tmax for that date
+    """
+    corrector.update(forecast_date, ml_prediction, actual_tmax)
+    error = actual_tmax - ml_prediction
+    print(f"  [CORRECTOR] Updated with real error for {forecast_date}: "
+          f"predicted={ml_prediction:.1f}C  actual={actual_tmax:.1f}C  "
+          f"error={error:+.1f}C")
+    save_corrector(corrector, city, data_folder)
+
+
+# =============================================================================
 # TIMEZONE
 # =============================================================================
 
@@ -258,9 +336,145 @@ def to_local(series: pd.Series, tz_name: str) -> pd.Series:
     return s.dt.tz_convert(tz).dt.tz_localize(None)
 
 
-# =============================================================================
-# STAGE 1: LOAD
-# =============================================================================
+# American timezone prefixes — markets for these cities use Fahrenheit
+_AMERICAN_TZ_PREFIXES = ("America/", "US/", "Pacific/Honolulu")
+
+def is_fahrenheit_city(timezone: str) -> bool:
+    """Return True for cities whose market buckets are in Fahrenheit (US cities)."""
+    return timezone.startswith(_AMERICAN_TZ_PREFIXES)
+
+
+def c_to_f(c: float) -> int:
+    """Convert Celsius to Fahrenheit and round to nearest integer."""
+    return round(c * 9 / 5 + 32)
+
+
+def get_target_date(paired_df: pd.DataFrame,
+                    model_daily_df: pd.DataFrame = None) -> str:
+    """
+    Derive the target prediction date from the paired training data.
+
+    target_date = last date in paired_df + 1 day.
+
+    If model_daily_df is supplied, we verify that tomorrow's row actually exists
+    in the model data and warn clearly if it does not — this means your model
+    CSV does not yet include tomorrow's forecast and the pipeline cannot predict.
+
+    paired_df["date"] is already in local time (daily_metar / daily_model both
+    convert to local), so no clock or timezone arithmetic is needed here.
+    """
+    last   = paired_df["date"].max()
+    target = last + datetime.timedelta(days=1)
+    target_str = target.strftime("%Y-%m-%d")
+
+    if model_daily_df is not None:
+        model_max = model_daily_df["date"].max()
+        if model_max < target:
+            print(f"  [WARNING] Model data ends at {model_max.date()} but target is "
+                  f"{target_str}. Tomorrow's NWP forecast is missing — "
+                  f"make sure your model CSV includes tomorrow's data.")
+
+    return target_str
+
+
+def load_market_data(city: str, timezone: str,
+                     target_date: str,
+                     data_folder: str = "mos_data") -> tuple:
+    """
+    Load buckets AND market prices from  data/<date>/market-<date>.csv
+
+    Parameters
+    ----------
+    city        : city name matching the CSV "city" column (case-insensitive)
+    timezone    : IANA timezone — used only for Fahrenheit city detection
+    target_date : "YYYY-MM-DD" of the day being predicted. Must be derived from
+                  the last paired training date + 1 day, NOT the system clock.
+    data_folder : root data folder (resolved relative to this script)
+
+    Returns
+    -------
+    (buckets, market_prices)
+    buckets       : sorted list of ints in CELSIUS
+    market_prices : dict {int_celsius_bucket: float_YES_price}
+    On any failure returns (None, None).
+
+    Title parsing
+    -------------
+    "19°C or below" -> 19,  "21°C" -> 21,  "29°C or higher" -> 29
+    American cities: CSV titles in °F, converted back to °C internally.
+
+    Path resolution
+    ---------------
+    Always relative to this script's own directory.
+    """
+    import re
+    import ast
+
+    script_dir   = Path(__file__).resolve().parent
+    data_dir     = script_dir /  "data" / target_date
+    csv_path     = data_dir / f"market-{target_date}.csv"
+
+    # --- Existence checks with clear error messages ---
+    if not data_dir.exists():
+        print(f"  [MARKET] Folder not found: {data_dir}  — will simulate prices.")
+        return None, None
+
+    if not csv_path.exists():
+        print(f"  [MARKET] File not found: {csv_path}  — will simulate prices.")
+        return None, None
+
+    df = pd.read_csv(csv_path)
+
+    # Filter to this city (case-insensitive)
+    city_df = df[df["city"].str.lower() == city.lower()].copy()
+    if len(city_df) == 0:
+        print(f"  [MARKET] City '{city}' not found in {csv_path.name}  — will simulate.")
+        return None, None
+
+    fahrenheit = is_fahrenheit_city(timezone)
+    prices_c   = {}   # all keys stored in Celsius
+
+    for _, row in city_df.iterrows():
+        title = str(row["title"])
+
+        # --- Parse YES price (first element of the JSON list) ---
+        try:
+            price_list = ast.literal_eval(row["prices"])
+            yes_price  = float(price_list[0])
+        except Exception:
+            print(f"  [MARKET] Could not parse prices column for row: {title!r} — skipping.")
+            continue
+
+        # --- Parse temperature integer from title ---
+        # Optional leading minus handles negative temps (e.g. "-5°C or below")
+        nums = re.findall(r"-?\d+", title)
+        if not nums:
+            print(f"  [MARKET] No temperature integer found in title: {title!r} — skipping.")
+            continue
+        temp_raw = int(nums[0])
+
+        # --- For American cities: CSV is in °F, convert back to °C ---
+        if fahrenheit:
+            temp_c = round((temp_raw - 32) * 5 / 9)
+        else:
+            temp_c = temp_raw
+
+        prices_c[temp_c] = yes_price
+
+    if not prices_c:
+        print(f"  [MARKET] No valid rows parsed from {csv_path.name}  — will simulate.")
+        return None, None
+
+    # Buckets = sorted Celsius integers (preserves natural ascending order)
+    buckets = sorted(prices_c.keys())
+
+    unit = "°F" if fahrenheit else "°C"
+    print(f"  [MARKET] Loaded {len(buckets)} buckets for '{city}' "
+          f"from {csv_path.name}  (date: {target_date}, market in {unit})")
+    print(f"  [MARKET] Buckets (°C): {buckets}")
+
+    return buckets, prices_c
+
 
 def load_metar(station: str, data_folder: str = "mos_data") -> pd.DataFrame:
     df = pd.read_csv(Path(data_folder) / f"{station}.csv")
@@ -338,9 +552,18 @@ def daily_metar(metar_df, station, tz):
     df = metar_df[metar_df["station"] == station].copy()
     df["lt"] = to_local(df["valid"], tz)
     df["ld"] = df["lt"].dt.date
+    last_date = df["ld"].max()
     rows = []
     for d, g in df.groupby("ld"):
-        if len(g) < 20: continue
+        # Require >= 20 observations for a complete day.
+        # Exception: the most recent local date may be partial (today still in
+        # progress). Keep it regardless of obs count so its tmax_actual feeds
+        # the corrector seeder. Without this, cities like Wellington (UTC+12)
+        # always lag one day behind because today's local date never accumulates
+        # 20 obs before the pipeline runs.
+        # is_last = (d == last_date)
+        if len(g) < 20 : # if len(g) < 20 and not is_last:
+            continue
         idx      = g["tmpc"].idxmax()
         peak     = g[g["lt"].dt.hour.between(11, 15)]
         if len(peak) == 0: peak = g
@@ -353,20 +576,35 @@ def daily_metar(metar_df, station, tz):
             "humidity_at_peak": round(float(peak["relh"].mean()), 1),
             "cloud_at_peak":    round(float(cloud), 1),
             "obs_count":        len(g),
+            "is_partial":       len(g) < 20, # "is_partial":       is_last and len(g) < 20,
         })
     r = pd.DataFrame(rows)
-    print(f"  [ALIGN] {len(r)} daily METAR records ({station})")
+    partial = int(r["is_partial"].sum()) if "is_partial" in r.columns else 0
+    print(f"  [ALIGN] {len(r)} daily METAR records ({station})"
+          + ("  [1 partial day kept]" if partial else ""))
     return r
 
 
 def daily_model(model_df, tz):
     df    = model_df.copy()
-    df["lt"] = to_local(df["date"].dt.tz_localize("UTC"), tz)
+    # df["date"] may be tz-naive (load_model_forecasts strips tz) or tz-aware.
+    # Always localise as UTC before converting to local time.
+    if df["date"].dt.tz is None:
+        # load_model_forecasts strips tz with tz_localize(None), leaving the
+        # column tz-naive but numerically UTC. Re-localise here before converting.
+        dt_utc = df["date"].dt.tz_localize("UTC")
+    else:
+        dt_utc = df["date"].dt.tz_convert("UTC")
+    df["lt"] = to_local(dt_utc, tz)
     df["ld"] = df["lt"].dt.date
     tcols = [f"temperature_2m_{m}" for m in MODELS if f"temperature_2m_{m}" in df.columns]
     rows  = []
     for d, g in df.groupby("ld"):
-        if len(g) < 20: continue
+        # Strict filter: only complete days (>= 20 obs) go into the paired
+        # training data. Partial/future dates are handled separately by
+        # get_tomorrow_model_row() which reads raw hourly data directly.
+        if len(g) < 20:
+            continue
         row = {"date": pd.Timestamp(d)}
         for c in tcols: row[f"{c}_max"] = float(g[c].max())
         mx = [row[f"{c}_max"] for c in tcols]
@@ -386,8 +624,82 @@ def daily_model(model_df, tz):
     return r
 
 
+def get_tomorrow_model_row(mo_raw: pd.DataFrame, tz: str,
+                           target_date: str) -> pd.Series:
+    """
+    Aggregate the raw hourly model data for target_date into a single daily row,
+    using the same aggregation logic as daily_model but with NO obs-count filter.
+
+    This is used exclusively by make_forecast to get tomorrow's NWP features.
+    It must bypass the >= 20 obs filter because:
+      - Tomorrow's data may only be a partial day in the download window
+      - Even a few hours of forecast data are enough for daily max temperature
+
+    Parameters
+    ----------
+    mo_raw      : raw model DataFrame from load_model_forecasts (tz-naive UTC)
+    tz          : IANA timezone string
+    target_date : "YYYY-MM-DD" local date being predicted
+
+    Returns
+    -------
+    pd.Series with the same columns as daily_model rows, or raises ValueError
+    if no model data exists for target_date.
+    """
+    df = mo_raw.copy()
+    if df["date"].dt.tz is None:
+        dt_utc = df["date"].dt.tz_localize("UTC")
+    else:
+        dt_utc = df["date"].dt.tz_convert("UTC")
+    df["lt"] = to_local(dt_utc, tz)
+    df["ld"] = df["lt"].dt.date
+
+    target_d = pd.Timestamp(target_date).date()
+    g = df[df["ld"] == target_d]
+
+    if len(g) == 0:
+        local_dates = sorted(df["ld"].unique())
+        raise ValueError(
+            f"[FORECAST] No model data found for {target_date} (local). "
+            f"Available local dates: {local_dates[0]} to {local_dates[-1]}. "
+            f"Ensure your model CSV includes a forecast for {target_date}."
+        )
+
+    tcols = [f"temperature_2m_{m}" for m in MODELS if f"temperature_2m_{m}" in df.columns]
+    row = {"date": pd.Timestamp(target_date)}
+    for c in tcols:
+        row[f"{c}_max"] = float(g[c].max())
+    mx = [row[f"{c}_max"] for c in tcols]
+    row["model_spread"]   = float(max(mx) - min(mx))
+    row["model_mean_max"] = float(np.mean(mx))
+    row["model_std_max"]  = float(np.std(mx))
+    pk = g[g["lt"].dt.hour.between(11, 15)]
+    if len(pk) == 0:
+        pk = g
+    for src_col, dst_col in [("ens_cloud",    "cloud_cover_forecast"),
+                              ("ens_humidity", "humidity_forecast"),
+                              ("ens_wind",     "wind_forecast"),
+                              ("ens_solar",    "solar_ghi_forecast")]:
+        if src_col in df.columns:
+            row[dst_col] = float(pk[src_col].mean())
+
+    print(f"  [FORECAST] Tomorrow model row ({target_date}): "
+          f"{len(g)} hourly obs used, "
+          f"mean_max={row.get('model_mean_max', float('nan')):.1f}C")
+    return pd.Series(row)
+
+
 def pair(metar_d, model_d):
-    p = pd.merge(metar_d, model_d, on="date", how="inner")
+    # Exclude partial METAR days from training.
+    # daily_metar keeps the most recent partial day so its tmax_actual can
+    # feed the corrector seeder, but a partial day's tmax is unreliable for
+    # training — the day is not over yet. If we leave it in, fd ends one day
+    # later than it should, pushing the target date forward by one.
+    if "is_partial" in metar_d.columns:
+        train_metar = metar_d[~metar_d["is_partial"]].copy()
+    else:
+        train_metar = metar_d
+    p = pd.merge(train_metar, model_d, on="date", how="inner")
     print(f"  [PAIR]  {len(p)} paired days")
     if len(p) == 0:
         raise ValueError("No overlapping dates — check timezone / city name / date ranges")
@@ -522,10 +834,18 @@ def seed_corrector(df: pd.DataFrame, seed_days: int = 14,
         print(f"  [SEED]  Not enough data to seed corrector")
         return corr
 
-    print(f"  [SEED]  Running {n - start_idx} day(s) of out-of-sample prediction "
+    # Stop at n-1, NOT n.
+    # The last row of df (index n-1) is the feature row that make_forecast()
+    # uses to predict tomorrow. We have never issued a real forecast for it —
+    # its "error" would be in-sample noise, not a genuine out-of-sample error.
+    # Including it feeds a spurious data point into the corrector that biases
+    # every subsequent forecast. It's the exact cause of the sign-flip bug:
+    # the corrector was seeing a -0.2 error for the day it was about to predict.
+    seed_end = n - 1
+    print(f"  [SEED]  Running {seed_end - start_idx} day(s) of out-of-sample prediction "
           f"to seed real-time corrector...")
 
-    for test_idx in range(start_idx, n):
+    for test_idx in range(start_idx, seed_end):
         train = df.iloc[:test_idx]
         row   = df.iloc[test_idx]
         m, sc, us, fv = fit_model(train[fc], train["tmax_actual"])
@@ -565,7 +885,13 @@ def walk_forward_validate(df: pd.DataFrame,
         row    = df.iloc[idx]
         m, sc, us, fv = fit_model(train[fc], train["tmax_actual"])
         ml_p   = predict_row(m, sc, us, fv, fc, row)
-        rt     = corr.correction()
+        # Use last observed tmax (previous row's actual) for jump dampening,
+        # matching exactly what the production corrector does in make_forecast.
+        # Previously called corr.correction() with no args, so dampening was
+        # never applied — making walk-forward evaluate a different behaviour
+        # than production and producing a slightly optimistic MAE estimate.
+        last_obs = float(df["tmax_actual"].iloc[idx - 1]) if idx > 0 else None
+        rt     = corr.correction(model_forecast=ml_p, last_observed=last_obs)
         final  = round(ml_p + rt, 1)
         actual = float(row["tmax_actual"])
         corr.update(row["date"], ml_p, actual)
@@ -663,23 +989,101 @@ def train_final(df: pd.DataFrame):
 # =============================================================================
 
 def make_forecast(model, scaler, use_scaling, fill_values, fc,
-                  df, corrector, error_series):
-    latest = df.iloc[-1].copy()
-    latest["tmax_yesterday"]  = df["tmax_actual"].iloc[-1]
-    latest["tmax_2days_ago"]  = df["tmax_actual"].iloc[-2]
-    latest["temp_trend_3day"] = df["tmax_actual"].iloc[-3:].mean()
+                  fd, mo_raw, timezone, target_date, corrector, error_series):
+    """
+    Build a synthetic "tomorrow" row and predict its temperature.
 
-    ml_p         = predict_row(model, scaler, use_scaling, fill_values, fc, latest)
-    last_observed = float(df["tmax_actual"].iloc[-1])
+    WHY THIS IS NECESSARY
+    ---------------------
+    The paired DataFrame (fd) only contains dates where BOTH METAR and model
+    data exist. Since METAR has no tomorrow, fd ends at today. If we used
+    fd.iloc[-1] directly we would be predicting today not tomorrow — the model
+    features would be today's NWP forecasts, not tomorrow's.
 
-    # Pass ml_p and last_observed so the corrector can apply jump dampening.
-    # When the model predicts a large departure from recent observed temps,
-    # the recent error history is from a different regime and gets down-weighted.
+    THE CORRECT APPROACH
+    --------------------
+    Two separate data sources are needed:
+      - Model columns  : tomorrow's row in od (the daily_model output).
+                         This is the date fd ends at + 1. It exists in od
+                         because NWP models always forecast ahead.
+      - Lag features   : computed from fd (METAR-based actuals up to today).
+                         tmax_yesterday, tmax_2days_ago, temp_trend_3day,
+                         and all bias_* features come from here.
+      - Derived features: recomputed from the tomorrow model row + today's lags.
+                         forecast_anomaly, model_spread, clear_calm_index, etc.
+
+    Parameters
+    ----------
+    fd          : paired + featured DataFrame, ends at today
+    od          : daily_model output (model-only daily rows), includes tomorrow
+    target_date : str "YYYY-MM-DD" — the date being predicted (tomorrow)
+    """
+    import warnings
+
+    # ── 1. Get tomorrow's model row from raw hourly data ─────────────────────
+    # get_tomorrow_model_row() bypasses the >= 20 obs filter so it works even
+    # when tomorrow has only a few hours of data in the model download window.
+    # target_ts is used later for calendar features.
+    target_ts = pd.Timestamp(target_date)
+    tom       = get_tomorrow_model_row(mo_raw, timezone, target_date)
+    today     = fd.iloc[-1]
+    # ── 2. Build the synthetic forecast row ──────────────────────────────────
+    # Start from a clean dict so we have full control over every feature.
+    # Three categories of features need different sources:
+    #
+    #   A) Tomorrow's NWP values  → from tom (tomorrow's model row in od)
+    #   B) Lag / bias features    → from fd (today's paired row — METAR-derived)
+    #   C) Derived / calendar     → computed fresh
+    row = tom.copy()
+    today = fd.iloc[-1]
+
+    # ── A) Lag features (from METAR actuals up to today) ─────────────────────
+    # build_features defines these via .shift() on tmax_actual:
+    #   tmax_yesterday  = shift(1) → for tomorrow's row = today's actual
+    #   tmax_2days_ago  = shift(2) → yesterday's actual
+    #   temp_trend_3day = rolling(3).mean().shift(1) → mean of today, yesterday, day before
+    row["tmax_yesterday"]  = float(fd["tmax_actual"].iloc[-1])    # today
+    row["tmax_2days_ago"]  = float(fd["tmax_actual"].iloc[-2])    # yesterday
+    row["temp_trend_3day"] = float(fd["tmax_actual"].iloc[-3:].mean())  # 3-day mean
+
+    # ── B) Bias and anomaly features (carried from today's fd row) ────────────
+    # These are rolling means of past errors — tomorrow has no actual yet so
+    # we carry today's computed values forward unchanged.
+    for col in fc:
+        if (col.startswith("bias_3d_") or col.startswith("bias_14d_") or
+                col == "forecast_anomaly"):
+            if col in today.index and pd.notna(today[col]):
+                row[col] = today[col]
+
+    # ── C) Derived features recomputed from tomorrow's NWP values ─────────────
+    # model_max_spread: max minus min across all model temperature columns
+    tm_cols = [f"temperature_2m_{m}_max" for m in MODELS
+               if f"temperature_2m_{m}_max" in row.index]
+    if len(tm_cols) >= 2:
+        vals = [row[c] for c in tm_cols if pd.notna(row.get(c))]
+        row["model_max_spread"] = max(vals) - min(vals) if len(vals) >= 2 else 0.0
+
+    # clear_calm_index and effective_solar use tomorrow's cloud/wind/solar/humidity
+    cloud    = row.get("cloud_cover_forecast", 50)
+    wind     = row.get("wind_forecast", 5)
+    solar    = row.get("solar_ghi_forecast", 0)
+    humidity = row.get("humidity_forecast", 70)
+    row["clear_calm_index"] = (100 - cloud) / (wind + 1)
+    row["effective_solar"]  = solar * (1 - humidity / 200)
+
+    # Calendar features for tomorrow's date
+    row["day_of_year"] = target_ts.dayofyear
+    row["month"]       = target_ts.month
+
+    # ── 3. Predict ───────────────────────────────────────────────────────────
+    ml_p          = predict_row(model, scaler, use_scaling, fill_values, fc, row)
+    last_observed = float(fd["tmax_actual"].iloc[-1])   # today's observed tmax
+
     rt    = corrector.correction(model_forecast=ml_p, last_observed=last_observed)
     final = round(ml_p + rt, 1)
 
-    es    = float(error_series.std())
-    eb    = float(error_series.mean())
+    es = float(error_series.std())
+    eb = float(error_series.mean())
 
     return {
         "final_forecast":      final,
@@ -736,17 +1140,15 @@ def bet_recs(ml_probs, market_prices, min_edge=0.05):
 # =============================================================================
 
 def run_pipeline(
-    station:            str,
-    city:               str,
-    timezone:           str,
-    data_folder:        str   = "mos_data",
-    buckets:            list  = None,
-    market_prices:      dict  = None,
-    temp_min:           float = -40.0,
-    temp_max:           float = 60.0,
-    initial_train_days: int   = 365,
-    run_walk_forward:   bool  = False,
-    corrector_seed_days: int  = 14,
+    station:             str,
+    city:                str,
+    timezone:            str,
+    data_folder:         str   = "mos_data",
+    temp_min:            float = -40.0,
+    temp_max:            float = 60.0,
+    initial_train_days:  int   = 365,
+    run_walk_forward:    bool  = False,
+    corrector_seed_days: int   = 14,
     corrector_decay:     float = 0.7,
     corrector_jump_scale: float = 2.0,
 ):
@@ -756,14 +1158,16 @@ def run_pipeline(
     station              : ICAO code  e.g. "VILK", "LEMD"
     city                 : Must match 'city' column in historical CSV
     timezone             : IANA string  e.g. "Asia/Kolkata", "Europe/Madrid"
+    data_folder          : Root folder for all data (METAR, model, market CSVs)
     temp_min/max         : Physical bounds for cleaning (defaults work globally)
     initial_train_days   : Min days before first walk-forward prediction
     run_walk_forward     : Full multi-year walk-forward (slow). False = just seed.
     corrector_seed_days  : How many recent days to use for seeding the corrector.
-                           14 is fast (~5s). Increase to 30 for more stable seeding.
+
+    Buckets and market prices are loaded automatically from:
+        <data_folder>/data/<tomorrow_local_date>/market-<date>.csv
+    No need to pass them manually.
     """
-    if buckets is None:
-        buckets = [38, 39, 40, 41, 42, 43, 44]
 
     try: pytz.timezone(timezone)
     except pytz.exceptions.UnknownTimeZoneError:
@@ -805,11 +1209,28 @@ def run_pipeline(
     print("\n[5c] FINAL MODEL")
     model, scaler, use_sc, fill_v, fc = train_final(fd)
 
-    # Seed corrector from real out-of-sample errors
-    # This ALWAYS runs — it is fast and ensures the corrector has real signal.
-    print(f"\n[5d] SEEDING REAL-TIME CORRECTOR  (last {corrector_seed_days} days OOS)")
-    corrector = seed_corrector(fd, seed_days=corrector_seed_days,
-                              decay=corrector_decay, jump_scale=corrector_jump_scale)
+    # -----------------------------------------------------------------------
+    # [5d] CORRECTOR — load persisted real errors OR seed from walk-forward
+    #
+    # The corrector must track errors from the ACTUAL issued forecasts, not
+    # from throwaway mini-models. Each run saves its state; the next run loads
+    # it so the corrector accumulates genuine day-by-day operational errors.
+    #
+    # First run ever (no saved state): fall back to walk-forward seeding so
+    # the corrector has something reasonable to start with.
+    # -----------------------------------------------------------------------
+    print(f"\n[5d] CORRECTOR")
+    corrector = load_corrector(city, data_folder,
+                               decay=corrector_decay,
+                               jump_scale=corrector_jump_scale)
+    if corrector is None:
+        print(f"  No saved state found — seeding from walk-forward "
+              f"(last {corrector_seed_days} days OOS)")
+        corrector = seed_corrector(fd, seed_days=corrector_seed_days,
+                                   decay=corrector_decay,
+                                   jump_scale=corrector_jump_scale)
+    else:
+        print(f"  [CORRECTOR] State: {corrector.summary()}")
 
     # Error series for CI width
     # If walk-forward ran, use those honest errors. Otherwise use in-sample.
@@ -821,10 +1242,34 @@ def run_pipeline(
         pall  = model.predict(scaler.transform(Xall) if use_sc else Xall)
         err_series = pd.Series(fd["tmax_actual"].values - pall)
 
-    print("\n[6] FORECAST FOR TOMORROW")
-    pred = make_forecast(model, scaler, use_sc, fill_v, fc, fd, corrector, err_series)
+    # -----------------------------------------------------------------------
+    # Step 6 & 7 – load market data, forecast, bet recommendations
+    # The local tomorrow date drives:
+    #   a) the section header  b) the market CSV path
+    # We use local time (not UTC) because the pipeline skips the last partial
+    # METAR day and some cities are still on "today" in UTC at run time.
+    # -----------------------------------------------------------------------
+    # Derive target date from the last paired training row, not the system clock.
+    # fd["date"] is already in local time (daily_metar/daily_model convert it).
+    target_date = get_target_date(fd)
 
-    print(f"\n  ML model forecast    : {pred['ml_forecast']}C")
+    print("\n[MARKET] Loading buckets and prices from market CSV ...")
+    buckets, market_prices = load_market_data(city, timezone, target_date, data_folder)
+
+    # Fall back to simulation only when the market file is genuinely absent
+    if buckets is None:
+        buckets = sorted(set(range(18, 40)))   # broad default — never used in production
+        raw = {b: np.random.uniform(0.05, 0.35) for b in buckets}
+        tot = sum(raw.values())
+        market_prices = {b: round(v / tot, 3) for b, v in raw.items()}
+        print("  (Using simulated buckets and prices — no market file found)")
+
+    print(f"\n[6] FORECAST FOR {target_date}")
+    pred = make_forecast(model, scaler, use_sc, fill_v, fc,
+                         fd, mo, timezone, target_date, corrector, err_series)
+
+    print(f"\n  Target date          : {target_date}")
+    print(f"  ML model forecast    : {pred['ml_forecast']}C")
     print(f"  Last observed tmax   : {pred['last_observed_tmax']}C")
     print(f"  Forecast jump        : {pred['forecast_jump']:+.1f}C")
     print(f"  ──────────────────────────────────────────────")
@@ -836,21 +1281,19 @@ def run_pipeline(
     print(f"  80% CI               : {pred['ci_80'][0]}C – {pred['ci_80'][1]}C")
     print(f"  95% CI               : {pred['ci_95'][0]}C – {pred['ci_95'][1]}C")
 
-    print("\n[7] BET RECOMMENDATION")
+    print(f"\n[7] BET RECOMMENDATION  ({target_date})")
+    # bucket_probs works in Celsius — buckets are already in C (load_market_data
+    # converts F->C for American cities so everything here is always Celsius)
     probs = bucket_probs(pred["final_forecast"], pred["error_std"], buckets)
 
-    if market_prices is None:
-        raw = {b: np.random.uniform(0.05, 0.35) for b in buckets}
-        tot = sum(raw.values())
-        market_prices = {b: round(v/tot, 3) for b, v in raw.items()}
-        print("  (Simulated market prices)")
-
-    print(f"\n  {'Bucket':<9} {'ML%':>7}  {'Market%':>8}  {'Edge':>7}  Action")
-    print("  " + "-" * 48)
+    print(f"\n  {'Bucket':<6} {'ML%':>7}  {'Market%':>8}  {'Edge':>7}  Action")
+    print("  " + "-" * 46)
     for b in buckets:
-        mp   = probs.get(b, 0); mkt = market_prices.get(b, 0); e = mp - mkt
+        mp   = probs.get(b, 0)
+        mkt  = market_prices.get(b, 0)
+        e    = mp - mkt
         flag = "  BET" if abs(e) >= 0.05 else ""
-        print(f"  {b}C      {mp:>6.1%}   {mkt:>6.1%}   {e:>+6.1%}{flag}")
+        print(f"  {b}C     {mp:>6.1%}   {mkt:>6.1%}   {e:>+6.1%}{flag}")
 
     bets = bet_recs(probs, market_prices)
     if bets:
@@ -861,6 +1304,25 @@ def run_pipeline(
     else:
         print("\n  No bets above edge threshold.")
 
+    # Save corrector state so the next run has a starting point.
+    # IMPORTANT: this saves the pre-forecast state — the corrector does NOT yet
+    # know today's actual tmax. After the real tmax is observed, you MUST call:
+    #
+    #   update_and_save_corrector(
+    #       result["corrector"],
+    #       forecast_date = target_date,
+    #       ml_prediction = result["forecast"]["ml_forecast"],
+    #       actual_tmax   = <observed tmax>,
+    #       city          = city,
+    #       data_folder   = data_folder,
+    #   )
+    #
+    # Without this call the corrector never accumulates real operational errors
+    # and will keep re-seeding from mini-models on every run.
+    save_corrector(corrector, city, data_folder)
+    print(f"  [CORRECTOR] Reminder: call update_and_save_corrector() once "
+          f"today's actual tmax for {target_date} is observed.")
+
     print("\n" + "=" * 65)
     print("  Done.")
     print("=" * 65)
@@ -868,7 +1330,8 @@ def run_pipeline(
     return {"model": model, "scaler": scaler, "use_scaling": use_sc,
             "fill_values": fill_v, "feature_cols": fc,
             "corrector": corrector, "wf_results": wf, "cv_results": cv,
-            "forecast": pred, "paired_df": pd_, "featured_df": fd, "bets": bets}
+            "forecast": pred, "paired_df": pd_, "featured_df": fd, "bets": bets,
+            "target_date": target_date}
 
 
 # =============================================================================
@@ -941,8 +1404,6 @@ if __name__ == "__main__":
         city                = selected_city["name"],
         timezone            = selected_city["timezone"],
         data_folder         = "mos_data",
-        buckets             = [20,21,22,23,24,25,26,27,28,29,30,31],
-        market_prices       = None,
         initial_train_days  = 1400,
         run_walk_forward    = False,   # set True for full diagnostic (slow)
         corrector_seed_days = 14,      # increase to 30 for more stable seeding
@@ -951,13 +1412,10 @@ if __name__ == "__main__":
     # Madrid
     # result = run_pipeline(
     #     station             = "LEMD",
-    #     city                = "Madrid",
+    #     city                = "madrid",
     #     timezone            = "Europe/Madrid",
     #     data_folder         = "mos_data",
-    #     buckets             = [14,15,16,17,18,19,20,21,22,23,24,25,26],
-    #     market_prices       = None,
     #     initial_train_days  = 365,
     #     run_walk_forward    = False,
     #     corrector_seed_days = 14,
     # )
-

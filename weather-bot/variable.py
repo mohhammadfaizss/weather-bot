@@ -53,6 +53,7 @@ MODELS = [
     "gem_seamless",
     "gfs_seamless",
     "icon_seamless",
+    "gfs_hrrr",
     "ukmo_seamless",
 ]
 
