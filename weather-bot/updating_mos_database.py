@@ -101,7 +101,8 @@ class update_mos_database :
                 df_wide.columns.name = None 
 
                 filename = f"historical_{city["name"]}.csv"
-                folder_path = BASE_DIR / filename
+                child_folder = "forcast_data"
+                folder_path = BASE_DIR / child_folder /filename
                 # 4. Save to CSV
                 old_df = pd.read_csv(folder_path)
                 combined_df = pd.concat([old_df, df_wide]).drop_duplicates()
@@ -146,7 +147,8 @@ class update_mos_database :
 
             new_df = pd.read_csv(StringIO(text))
 
-            file_path = BASE_DIR / f"{city['station']}.csv"
+            child_folder = "metar_data"
+            file_path = BASE_DIR / child_folder / f"{city['station']}.csv"
 
             
 
@@ -169,5 +171,5 @@ class update_mos_database :
 
 get_the_update = update_mos_database()
 
-get_the_update.updating_metar()
+# get_the_update.updating_metar()
 get_the_update.updating_forcast()

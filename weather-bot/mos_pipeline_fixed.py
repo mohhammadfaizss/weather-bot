@@ -624,7 +624,9 @@ def load_market_data(city: str, timezone: str,
 
 
 def load_metar(station: str, data_folder: str = "mos_data") -> pd.DataFrame:
-    df = pd.read_csv(Path(data_folder) / f"{station}.csv")
+    data_folder = Path(data_folder)
+    file_path = data_folder / "metar_data"
+    df = pd.read_csv(Path(file_path) / f"{station}.csv")
     df["valid"] = pd.to_datetime(df["valid"], utc=False)
     if "sknt" in df.columns and "wind_kt" not in df.columns:
         df = df.rename(columns={"sknt": "wind_kt"})
@@ -632,8 +634,11 @@ def load_metar(station: str, data_folder: str = "mos_data") -> pd.DataFrame:
 
 
 def load_model_forecasts(city: str, data_folder: str = "mos_data") -> pd.DataFrame:
-    p1 = Path(data_folder) / f"historical_{city}.csv"
-    p2 = Path(data_folder) / "historical.csv"
+    data_folder = Path(data_folder)
+    file_path = data_folder / "forcast_data"
+
+    p1 = Path(file_path) / f"historical_{city}.csv"
+    p2 = Path(file_path) / "historical.csv"
     path = p1 if p1.exists() else (p2 if p2.exists() else None)
     if path is None:
         raise FileNotFoundError(f"No model data found. Tried {p1} and {p2}")
