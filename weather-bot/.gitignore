@@ -5,3 +5,4 @@ ENV/
 __pycache__/
 *.cache.sqlite
 *.json
+*.log

@@ -1377,7 +1377,11 @@ def seed_corrector(df: pd.DataFrame, seed_days: int = 14,
         mos.fit(train)
         ml_p   = mos.predict_row(row)
         actual = float(row["tmax_actual"])
+        error  = actual - ml_p
+        date_s = row["date"].strftime("%Y-%m-%d")
         corr.update(row["date"], ml_p, actual)
+        print(f"  [CORRECTOR] Logged live error ({date_s}): "
+              f"Pred {ml_p:.1f}C  Actual {actual:.1f}C  Error {error:+.1f}C")
 
     print(f"  [SEED]  Corrector state: {corr.summary()}")
     return corr
@@ -1670,6 +1674,37 @@ def run_pipeline(
     except pytz.exceptions.UnknownTimeZoneError:
         raise ValueError(f"Unknown timezone '{timezone}'")
 
+    # ── Log file setup ────────────────────────────────────────────────
+    # Every run writes a timestamped log file to <data_folder>/logs/<city>/
+    # Terminal output is unchanged — logs are written in parallel.
+    import sys
+    log_dir = Path(data_folder) / "logs" / city
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = log_dir / f"{city}_{run_ts}.log"
+
+    class _Tee:
+        """Writes to both the original stdout and a log file simultaneously."""
+        def __init__(self, stream, filepath):
+            self._s = stream
+            self._f = open(filepath, "w", encoding="utf-8", buffering=1)
+        def write(self, data):
+            self._s.write(data)
+            self._f.write(data)
+        def flush(self):
+            self._s.flush()
+            self._f.flush()
+        def close(self):
+            self._f.close()
+        # Delegate everything else (isatty, fileno etc.) to original stream
+        def __getattr__(self, name):
+            return getattr(self._s, name)
+
+    _orig_stdout = sys.stdout
+    sys.stdout   = _Tee(sys.stdout, log_path)
+    print(f"  [LOG] Writing to {log_path}")
+    # ─────────────────────────────────────────────────────────────────
+
     print("=" * 65)
     print(f"  MOS  |  {station}  |  {city}  |  {timezone}")
     print("=" * 65)
@@ -1811,6 +1846,12 @@ def run_pipeline(
     print("\n" + "=" * 65)
     print("  Done.")
     print("=" * 65)
+
+    # ── Close log file ────────────────────────────────────────────────
+    sys.stdout.close()
+    sys.stdout = _orig_stdout
+    print(f"  [LOG] Run log saved -> {log_path}")
+    # ─────────────────────────────────────────────────────────────────
 
     return {"mos": mos, "corrector": corrector,
             "wf_results": wf, "cv_results": cv,
