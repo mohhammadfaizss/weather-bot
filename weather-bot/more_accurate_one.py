@@ -1,48 +1,16 @@
-# -*- coding: utf-8 -*-
 """
-MOS (Model Output Statistics) Pipeline  v4
+MOS (Model Output Statistics) Pipeline  v3
 ==========================================
 General-purpose: any city / climate / timezone.
 
-KEY CHANGES vs v3 (THE REAL MOS ARCHITECTURE)
-----------------------------------------------
-1. TWO-STAGE MOS -- the system now works as a genuine MOS, not a model-weighting
-   program. Stage 1 blends raw NWP outputs. Stage 2 corrects Stage 1 residuals
-   using bias/atmospheric features that were previously drowned out.
-   This is how operational NWS MOS (MAV/MEX) actually works.
-
-2. SEASONAL MODEL WEIGHTS -- a separate Stage 1 blender is trained per season
-   (DJF/MAM/JJA/SON). A model that wins annually no longer dominates a season
-   where a different model is actually better. The Chicago-in-April problem is
-   directly addressed here.
-
-3. STAGE 2 BIAS CORRECTION with Lasso -- trained ONLY on Stage 1 residuals.
-   Bias features (humidity_forecast, clear_calm_index, day_of_year, bias_3d_*,
-   bias_14d_*, forecast_anomaly) now compete only with each other, not with the
-   dominant NWP models. Each city learns its own Stage 2 feature weights via
-   L1 regularisation so irrelevant features zero out rather than getting tiny
-   useless weights.
-
-4. METAR ADDITIONS NEEDED -- see DATA NOTES below.
-
-DATA NOTES (v4)
----------------
-For Stage 2 to be most effective, add these columns to your data collection:
-
-forecast elements (open-meteo hourly):
-   EXISTING: temperature_2m, relative_humidity_2m, cloud_cover_low/mid/high,
-             wind_speed_10m, shortwave_radiation
-   ADD:      precipitation_probability, cape, surface_pressure,
-             wind_gusts_10m, dew_point_2m
-
-METAR data (Iowa State ASOS):
-   EXISTING: tmpc, dwpc, relh, skyc1, sknt, skyc2, skyc3, metar
-   ADD:      p01i (precip last hour), feel (apparent temp / heat index / windchill),
-             peak_wind_gust
-
-   sknt is already in your data -- wind_kt rename is handled.
-   p01i lets Stage 2 learn precipitation-temperature relationships.
-   feel lets Stage 2 learn local heat island / sea-breeze patterns.
+KEY CHANGES vs previous versions
+---------------------------------
+1. NaN crash fixed via safe_fillna() — median imputation with 0.0 fallback
+2. RealtimeBiasCorrector seeded from WALK-FORWARD out-of-sample errors,
+   not in-sample predictions (which are near-zero by definition)
+3. Walk-forward is always run for at least the last 14 days so the corrector
+   has real signal even when full walk-forward is disabled for speed
+4. Corrector state is printed so you can verify it is working
 
 DATA FORMATS
 ------------
@@ -56,13 +24,14 @@ historical_<City>.csv  or  historical.csv:
 TIMEZONE
 --------
 Always pass an IANA string  e.g. "Asia/Kolkata", "Europe/Madrid"
-Never pass a fixed offset -- it silently breaks DST cities.
+Never pass a fixed offset — it silently breaks DST cities.
 """
 
+from datetime import date
 import datetime
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.linear_model import Ridge
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
@@ -91,16 +60,6 @@ MODELS = [
 ]
 
 SKY_MAP = {"NSC": 0, "FEW": 20, "SCT": 45, "BKN": 75, "OVC": 100 , "NCD": 0}
-
-# Maps month -> meteorological season abbreviation
-# DJF=Winter, MAM=Spring, JJA=Summer, SON=Autumn
-SEASON_MAP = {
-    12: "DJF", 1: "DJF", 2: "DJF",
-    3:  "MAM", 4: "MAM", 5: "MAM",
-    6:  "JJA", 7: "JJA", 8: "JJA",
-    9:  "SON", 10:"SON", 11:"SON",
-}
-SEASONS = ["DJF", "MAM", "JJA", "SON"]
 
 
 # =============================================================================
@@ -146,9 +105,9 @@ class RealtimeBiasCorrector:
     ---------
     Uses exponential decay so recent days matter more than older ones.
     The decay rate is tunable:
-        decay=0.5  very aggressive -- most recent day dominates (too jumpy)
-        decay=0.7  moderate -- good default, smooth but still recency-aware
-        decay=0.9  nearly equal weights -- best for very stable slow biases
+        decay=0.5  very aggressive — most recent day dominates (too jumpy)
+        decay=0.7  moderate — good default, smooth but still recency-aware
+        decay=0.9  nearly equal weights — best for very stable slow biases
 
     With 5 days and decay=0.7, the effective weights are roughly:
         day-1: 36%,  day-2: 26%,  day-3: 18%,  day-4: 13%,  day-5: 7%
@@ -158,7 +117,7 @@ class RealtimeBiasCorrector:
     When tomorrow's model forecast is significantly different from the last
     observed tmax, the recent error history is from a different weather regime
     and should not be trusted. A 2C+ forecast jump means a regime transition
-    is likely in progress -- the corrector damps its output proportionally.
+    is likely in progress — the corrector damps its output proportionally.
 
     The dampening uses an exponential decay on jump size:
         dampening = exp(-jump / jump_scale)
@@ -188,36 +147,27 @@ class RealtimeBiasCorrector:
                  decay: float = 0.7, jump_scale: float = 2.0):
         self.window      = window
         self.min_periods = min_periods
-        self.decay       = decay
-        self.jump_scale  = jump_scale
-        self._history: list = []       # [(date, error), ...]  — rolling window
-        self._long_history: list = []  # [(date, error, jump), ...] — all-time, for adaptation
+        self.decay       = decay       # exponential decay rate per day back
+        self.jump_scale  = jump_scale  # scale for jump dampening (degrees C)
+        self._history: list = []       # [(date, error), ...]
 
-    def update(self, date, ml_prediction: float, actual: float,
-               forecast_jump: float = None) -> None:
-        """
-        Record error = actual - ml_prediction.
-        Optionally record the forecast_jump that was in effect, so
-        adapt_jump_scale() can measure whether dampening actually helped.
-        """
-        date_str  = str(date)
+    def update(self, date, ml_prediction: float, actual: float) -> None:
+        """Record error = actual - ml_prediction. Handles duplicates and backtesting."""
+        date_str = str(date)
         new_error = float(actual) - float(ml_prediction)
-
-        # Rolling window (used for correction)
+        
+        # Convert history to a dict for easy lookup/overwrite
         history_dict = dict(self._history)
+        
+        # Update or add the error for this specific date
         history_dict[date_str] = new_error
+        
+        # Re-sort by date string so the window always captures the most recent chronological days
         sorted_dates = sorted(history_dict.keys())
+        
+        # Rebuild history and apply the sliding window
         self._history = [(d, history_dict[d]) for d in sorted_dates]
         self._history = self._history[-self.window:]
-
-        # Long-term history (used for jump-scale adaptation)
-        # Keep up to 365 days — enough to measure the jump-error correlation
-        long_dict = {d: (e, j) for d, e, j in self._long_history}
-        long_dict[date_str] = (new_error, forecast_jump)
-        sorted_long = sorted(long_dict.keys())
-        self._long_history = [(d, long_dict[d][0], long_dict[d][1])
-                              for d in sorted_long]
-        self._long_history = self._long_history[-365:]
 
     def correction(self, model_forecast: float = None,
                    last_observed: float = None) -> float:
@@ -260,87 +210,6 @@ class RealtimeBiasCorrector:
 
         return round(base, 2)
 
-    def adapt_jump_scale(self, min_days: int = 60, verbose: bool = True) -> float:
-        """
-        Automatically adjust jump_scale based on this city's observed history.
-
-        LOGIC
-        -----
-        Dampening is useful only when large forecast jumps correlate with
-        large NEW errors — i.e. the recent bias history stops being predictive.
-
-        We measure this by splitting long_history into two groups:
-          - jump days   : abs(jump) >= 2C
-          - no-jump days: abs(jump) < 2C
-
-        Then compare: on jump days, does the error CHANGE SIGN compared to the
-        preceding window mean? If yes (high sign-flip rate) -> dampening helps
-        -> keep jump_scale low (2-3). If no (low sign-flip rate, bias is stable
-        even across jumps) -> dampening hurts -> raise jump_scale (8-20+).
-
-        Sets self.jump_scale in place and returns the new value.
-        Only runs when >= min_days of labelled history are available.
-        """
-        labelled = [(e, j) for _, e, j in self._long_history
-                    if j is not None]
-
-        if len(labelled) < min_days:
-            if verbose:
-                print(f"  [ADAPT] Only {len(labelled)} labelled days "
-                      f"(need {min_days}) -- keeping jump_scale={self.jump_scale:.1f}")
-            return self.jump_scale
-
-        errors = [e for e, _ in labelled]
-        jumps  = [j for _, j in labelled]
-
-        # For each jump day, check whether the error SIGN FLIPPED from the
-        # preceding 5-day window mean
-        sign_flips  = 0
-        jump_days   = 0
-        win         = 5
-
-        for i in range(win, len(labelled)):
-            if abs(jumps[i]) < 2.0:
-                continue
-            jump_days += 1
-            prev_mean  = float(np.mean(errors[i - win:i]))
-            curr_error = errors[i]
-            # Sign flip: previous window was positive, current is negative, or vice versa
-            if prev_mean != 0 and (np.sign(curr_error) != np.sign(prev_mean)):
-                sign_flips += 1
-
-        if jump_days < 10:
-            if verbose:
-                print(f"  [ADAPT] Only {jump_days} jump days in history "
-                      f"-- keeping jump_scale={self.jump_scale:.1f}")
-            return self.jump_scale
-
-        flip_rate = sign_flips / jump_days
-
-        # Map flip_rate to jump_scale:
-        #   flip_rate > 0.5  -> dampening helps a lot -> jump_scale = 2.0
-        #   flip_rate ~ 0.3  -> dampening helps some  -> jump_scale = 4.0
-        #   flip_rate ~ 0.15 -> dampening neutral      -> jump_scale = 8.0
-        #   flip_rate < 0.1  -> dampening hurts        -> jump_scale = 20.0 (near-disabled)
-        if   flip_rate >= 0.50: new_scale = 2.0
-        elif flip_rate >= 0.35: new_scale = 3.0
-        elif flip_rate >= 0.25: new_scale = 4.0
-        elif flip_rate >= 0.15: new_scale = 6.0
-        elif flip_rate >= 0.08: new_scale = 10.0
-        else:                   new_scale = 20.0
-
-        old_scale = self.jump_scale
-        self.jump_scale = new_scale
-
-        if verbose:
-            verdict = ("dampening helps" if new_scale <= 4.0
-                       else "dampening neutral" if new_scale <= 8.0
-                       else "dampening disabled")
-            print(f"  [ADAPT] jump_scale: {old_scale:.1f} -> {new_scale:.1f}  "
-                  f"({jump_days} jump days, {flip_rate:.0%} sign-flip rate -- {verdict})")
-
-        return new_scale
-
     def n_days(self) -> int:
         return len(self._history)
 
@@ -370,7 +239,7 @@ class RealtimeBiasCorrector:
             f"base correction: {base:+.2f}C",
         ]
         if jump is not None:
-            # Clamp to [0, 100] -- if correction crosses zero due to floating
+            # Clamp to [0, 100] — if correction crosses zero due to floating
             # point the raw formula overshoots and produces negative or >100%
             # values which are confusing in the output.
             if base != 0:
@@ -383,22 +252,19 @@ class RealtimeBiasCorrector:
         return "  |  ".join(parts)
 
     def state(self) -> dict:
-        return {"window":       self.window,
-                "min_periods":  self.min_periods,
-                "decay":        self.decay,
-                "jump_scale":   self.jump_scale,
-                "history":      [(str(d), e) for d, e in self._history],
-                "long_history": [(str(d), e, j)
-                                 for d, e, j in self._long_history]}
+        return {"window":      self.window,
+                "min_periods": self.min_periods,
+                "decay":       self.decay,
+                "jump_scale":  self.jump_scale,
+                "history":     [(str(d), e) for d, e in self._history]}
 
     @classmethod
     def from_state(cls, state: dict) -> "RealtimeBiasCorrector":
-        obj = cls(window      = state["window"],
-                  min_periods = state["min_periods"],
-                  decay       = state.get("decay",      0.7),
-                  jump_scale  = state.get("jump_scale", 2.0))
-        obj._history      = list(state["history"])
-        obj._long_history = list(state.get("long_history", []))
+        obj = cls(window     = state["window"],
+                  min_periods= state["min_periods"],
+                  decay      = state.get("decay",      0.7),
+                  jump_scale = state.get("jump_scale", 2.0))
+        obj._history = list(state["history"])
         return obj
 
 
@@ -408,18 +274,23 @@ class RealtimeBiasCorrector:
 
 def corrector_state_path(city: str, data_folder: str = "mos_data") -> Path:
     """Path to the JSON file that persists the corrector state between runs."""
-    data_folder = Path(data_folder)
-    full_path = data_folder / "corrector-folder"
+
     script_dir = Path(__file__).resolve().parent
+    data_folder = Path(data_folder)
+    full_path = data_folder / "json-folder"
     return script_dir / full_path / f"corrector_{city.lower()}.json"
 
 
 def save_corrector(corrector: RealtimeBiasCorrector,
                    city: str, data_folder: str = "mos_data") -> None:
+    """
+    Persist corrector state to disk after each run.
+    Call this AFTER observing the actual tmax and calling corrector.update().
+    In practice: call it at the end of run_pipeline so the next run picks up
+    the real error from today's forecast.
+    """
+
     import json
-    # Adapt jump_scale from long-term history before saving —
-    # so every city self-tunes over time without any manual config.
-    corrector.adapt_jump_scale(min_days=60, verbose=True)
     path = corrector_state_path(city, data_folder)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
@@ -463,8 +334,7 @@ def update_and_save_corrector(corrector: RealtimeBiasCorrector,
     ml_prediction  : The ml_forecast value from that day's run_pipeline output
     actual_tmax    : The real observed tmax for that date
     """
-    corrector.update(forecast_date, ml_prediction, actual_tmax,
-                     forecast_jump=abs(ml_prediction - actual_tmax))
+    corrector.update(forecast_date, ml_prediction, actual_tmax)
     error = actual_tmax - ml_prediction
     print(f"  [CORRECTOR] Updated with real error for {forecast_date}: "
           f"predicted={ml_prediction:.1f}C  actual={actual_tmax:.1f}C  "
@@ -483,7 +353,7 @@ def to_local(series: pd.Series, tz_name: str) -> pd.Series:
     return s.dt.tz_convert(tz).dt.tz_localize(None)
 
 
-# American timezone prefixes -- markets for these cities use Fahrenheit
+# American timezone prefixes — markets for these cities use Fahrenheit
 _AMERICAN_TZ_PREFIXES = ("America/", "US/", "Pacific/Honolulu")
 
 def is_fahrenheit_city(timezone: str) -> bool:
@@ -504,7 +374,7 @@ def get_target_date(paired_df: pd.DataFrame,
     target_date = last date in paired_df + 1 day.
 
     If model_daily_df is supplied, we verify that tomorrow's row actually exists
-    in the model data and warn clearly if it does not -- this means your model
+    in the model data and warn clearly if it does not — this means your model
     CSV does not yet include tomorrow's forecast and the pipeline cannot predict.
 
     paired_df["date"] is already in local time (daily_metar / daily_model both
@@ -518,7 +388,7 @@ def get_target_date(paired_df: pd.DataFrame,
         model_max = model_daily_df["date"].max()
         if model_max < target:
             print(f"  [WARNING] Model data ends at {model_max.date()} but target is "
-                  f"{target_str}. Tomorrow's NWP forecast is missing -- "
+                  f"{target_str}. Tomorrow's NWP forecast is missing — "
                   f"make sure your model CSV includes tomorrow's data.")
 
     return target_str
@@ -533,7 +403,7 @@ def load_market_data(city: str, timezone: str,
     Parameters
     ----------
     city        : city name matching the CSV "city" column (case-insensitive)
-    timezone    : IANA timezone -- used only for Fahrenheit city detection
+    timezone    : IANA timezone — used only for Fahrenheit city detection
     target_date : "YYYY-MM-DD" of the day being predicted. Must be derived from
                   the last paired training date + 1 day, NOT the system clock.
     data_folder : root data folder (resolved relative to this script)
@@ -563,11 +433,11 @@ def load_market_data(city: str, timezone: str,
 
     # --- Existence checks with clear error messages ---
     if not data_dir.exists():
-        print(f"  [MARKET] Folder not found: {data_dir}  -- will simulate prices.")
+        print(f"  [MARKET] Folder not found: {data_dir}  — will simulate prices.")
         return None, None
 
     if not csv_path.exists():
-        print(f"  [MARKET] File not found: {csv_path}  -- will simulate prices.")
+        print(f"  [MARKET] File not found: {csv_path}  — will simulate prices.")
         return None, None
 
     df = pd.read_csv(csv_path)
@@ -575,7 +445,7 @@ def load_market_data(city: str, timezone: str,
     # Filter to this city (case-insensitive)
     city_df = df[df["city"].str.lower() == city.lower()].copy()
     if len(city_df) == 0:
-        print(f"  [MARKET] City '{city}' not found in {csv_path.name}  -- will simulate.")
+        print(f"  [MARKET] City '{city}' not found in {csv_path.name}  — will simulate.")
         return None, None
 
     fahrenheit = is_fahrenheit_city(timezone)
@@ -589,14 +459,14 @@ def load_market_data(city: str, timezone: str,
             price_list = ast.literal_eval(row["prices"])
             yes_price  = float(price_list[0])
         except Exception:
-            print(f"  [MARKET] Could not parse prices column for row: {title!r} -- skipping.")
+            print(f"  [MARKET] Could not parse prices column for row: {title!r} — skipping.")
             continue
 
         # --- Parse temperature integer from title ---
         # Optional leading minus handles negative temps (e.g. "-5°C or below")
         nums = re.findall(r"-?\d+", title)
         if not nums:
-            print(f"  [MARKET] No temperature integer found in title: {title!r} -- skipping.")
+            print(f"  [MARKET] No temperature integer found in title: {title!r} — skipping.")
             continue
         temp_raw = int(nums[0])
 
@@ -609,7 +479,7 @@ def load_market_data(city: str, timezone: str,
         prices_c[temp_c] = yes_price
 
     if not prices_c:
-        print(f"  [MARKET] No valid rows parsed from {csv_path.name}  -- will simulate.")
+        print(f"  [MARKET] No valid rows parsed from {csv_path.name}  — will simulate.")
         return None, None
 
     # Buckets = sorted Celsius integers (preserves natural ascending order)
@@ -699,6 +569,7 @@ def daily_metar(metar_df, station, tz):
     df = metar_df[metar_df["station"] == station].copy()
     df["lt"] = to_local(df["valid"], tz)
     df["ld"] = df["lt"].dt.date
+    last_date = df["ld"].max()
     rows = []
     for d, g in df.groupby("ld"):
         # Require >= 20 observations for a complete day.
@@ -839,7 +710,7 @@ def pair(metar_d, model_d):
     # Exclude partial METAR days from training.
     # daily_metar keeps the most recent partial day so its tmax_actual can
     # feed the corrector seeder, but a partial day's tmax is unreliable for
-    # training -- the day is not over yet. If we leave it in, fd ends one day
+    # training — the day is not over yet. If we leave it in, fd ends one day
     # later than it should, pushing the target date forward by one.
     if "is_partial" in metar_d.columns:
         train_metar = metar_d[~metar_d["is_partial"]].copy()
@@ -848,7 +719,7 @@ def pair(metar_d, model_d):
     p = pd.merge(train_metar, model_d, on="date", how="inner")
     print(f"  [PAIR]  {len(p)} paired days")
     if len(p) == 0:
-        raise ValueError("No overlapping dates -- check timezone / city name / date ranges")
+        raise ValueError("No overlapping dates — check timezone / city name / date ranges")
     return p
 
 
@@ -870,6 +741,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         df["forecast_anomaly"] = df["model_mean_max"] - clim
 
     if len(tm) >= 2:
+        # Inter-model spread only — no top/bottom aggregates (they double-count
+        # individual model columns already in the feature set)
         df["model_max_spread"] = df[tm].max(axis=1) - df[tm].min(axis=1)
 
     if "cloud_cover_forecast" in df.columns and "wind_forecast" in df.columns:
@@ -877,141 +750,44 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if "solar_ghi_forecast" in df.columns and "humidity_forecast" in df.columns:
         df["effective_solar"]  = df["solar_ghi_forecast"] * (1 - df["humidity_forecast"] / 200)
 
-    # Per-model rolling bias features
     for c in tm:
         err = df["tmax_actual"] - df[c]
         key = c.replace("temperature_2m_", "").replace("_max", "")
+        # 3-day: catches fast regime shifts (heat spikes, cold outbreaks)
         df[f"bias_3d_{key}"]  = err.rolling(3,  min_periods=2).mean().shift(1)
+        # 14-day: captures slower seasonal model drift
         df[f"bias_14d_{key}"] = err.rolling(14, min_periods=3).mean().shift(1)
 
-    # Calendar features
     df["day_of_year"] = df["date"].dt.dayofyear
     df["month"]       = df["date"].dt.month
-    df["season"]      = df["month"].map(SEASON_MAP)
 
-    # Optional METAR enrichments -- included if the column was collected
-    # Add p01i (hourly precip) and feel (apparent temp) to your METAR download
-    # to activate these features in Stage 2.
-    if "precip_at_peak" in df.columns:
-        # Wet days suppress tmax through evaporative cooling
-        df["precip_flag"] = (df["precip_at_peak"] > 0.1).astype(float)
-    if "feel_at_peak" in df.columns and "tmax_actual" in df.columns:
-        # heat island / sea-breeze signal: apparent temp minus dry bulb
-        df["heat_island_signal"] = df["feel_at_peak"] - df["tmax_actual"]
-
+    # Only drop on anchor features — do NOT drop bias/anomaly NaNs here.
+    # safe_fillna handles those at training time.
     df = df.dropna(subset=["tmax_yesterday", "temp_trend_3day"]).reset_index(drop=True)
     print(f"  [FEAT]  {len(df)} rows x {len(df.columns)} cols")
     return df
 
 
-def feature_cols_stage1(df: pd.DataFrame) -> list:
-    """
-    Stage 1: ONLY raw NWP model temperature outputs + ensemble spread.
-    These are the columns that compete to blend into a single forecast.
-    Bias/atmospheric features are intentionally excluded here -- they belong
-    to Stage 2 where they correct the blend residual.
-    """
-    c = []
-    for m in MODELS:
-        col = f"temperature_2m_{m}_max"
-        if col in df.columns:
-            c.append(col)
-    for col in ["model_spread", "model_mean_max", "model_std_max", "model_max_spread"]:
-        if col in df.columns:
-            c.append(col)
-    return c
-
-
-def feature_cols_stage2(df: pd.DataFrame) -> list:
-    """
-    Stage 2: everything EXCEPT raw NWP temperature outputs.
-    These features correct the Stage 1 blend. They only compete with each
-    other (not with dominant models like ECMWF), so Lasso can assign them
-    meaningful non-zero weights.
-    """
-    c = []
-    # Atmospheric / observational corrections
-    for col in ["cloud_cover_forecast", "humidity_forecast", "wind_forecast",
-                "solar_ghi_forecast", "clear_calm_index", "effective_solar",
-                "forecast_anomaly"]:
-        if col in df.columns:
-            c.append(col)
-    # Recent observed temperature lags
-    for col in ["tmax_yesterday", "tmax_2days_ago", "temp_trend_3day"]:
-        if col in df.columns:
-            c.append(col)
-    # Short-window per-model bias (fast regime shifts)
-    for m in MODELS:
-        col = f"bias_3d_{m}"
-        if col in df.columns:
-            c.append(col)
-    # Long-window per-model bias (seasonal model drift)
-    for m in MODELS:
-        col = f"bias_14d_{m}"
-        if col in df.columns:
-            c.append(col)
-    # Calendar
-    for col in ["day_of_year", "month"]:
-        if col in df.columns:
-            c.append(col)
-    # Optional METAR enrichments
-    for col in ["precip_flag", "heat_island_signal"]:
-        if col in df.columns:
-            c.append(col)
-    return c
-
-
 def feature_cols(df: pd.DataFrame) -> list:
-    """
-    Combined feature list (Stage 1 + Stage 2) -- used ONLY by the legacy
-    single-stage walk-forward and cross-validation diagnostics.
-    The production path uses feature_cols_stage1 / feature_cols_stage2.
-    """
-    return feature_cols_stage1(df) + feature_cols_stage2(df)
-
-
-# =============================================================================
-# FEATURE COLUMN HELPERS -- STAGE 1 vs STAGE 2
-# =============================================================================
-
-def stage1_feature_cols(df: pd.DataFrame) -> list:
-    """
-    Stage 1: NWP model temperature columns ONLY.
-    Stage 1 learns to blend them -- nothing else competes for weight here.
-    """
-    cols = []
+    c = []
     for m in MODELS:
         col = f"temperature_2m_{m}_max"
-        if col in df.columns:
-            cols.append(col)
-    return cols
-
-
-def stage2_feature_cols(df: pd.DataFrame) -> list:
-    """
-    Stage 2: Bias-correction features.
-    Trained on Stage-1 residuals so they only learn what the blend missed.
-    These never compete with raw NWP columns for weight.
-    """
-    c = []
-    for col in ["model_spread", "model_mean_max", "model_std_max", "model_max_spread",
-                "cloud_cover_forecast", "humidity_forecast", "wind_forecast",
-                "solar_ghi_forecast", "clear_calm_index", "effective_solar",
-                "forecast_anomaly", "tmax_yesterday", "tmax_2days_ago",
-                "temp_trend_3day"]:
-        if col in df.columns:
-            c.append(col)
+        if col in df.columns: c.append(col)
+    for col in ["model_spread","model_mean_max","model_std_max","model_max_spread",
+                "cloud_cover_forecast","humidity_forecast","wind_forecast","solar_ghi_forecast",
+                "clear_calm_index","effective_solar","forecast_anomaly",
+                "tmax_yesterday","tmax_2days_ago","temp_trend_3day"]:
+        if col in df.columns: c.append(col)
+    # Short-window bias first — more responsive to recent regime changes
     for m in MODELS:
         col = f"bias_3d_{m}"
-        if col in df.columns:
-            c.append(col)
+        if col in df.columns: c.append(col)
+    # Long-window bias — slower seasonal model drift
     for m in MODELS:
         col = f"bias_14d_{m}"
-        if col in df.columns:
-            c.append(col)
-    for col in ["day_of_year", "month"]:
-        if col in df.columns:
-            c.append(col)
+        if col in df.columns: c.append(col)
+    for col in ["day_of_year","month"]:
+        if col in df.columns: c.append(col)
     return c
 
 
@@ -1021,7 +797,7 @@ def stage2_feature_cols(df: pd.DataFrame) -> list:
 
 def fit_model(X_raw: pd.DataFrame, y: pd.Series):
     """Fit GBM (>=60 rows) or Ridge. Returns (model, scaler, use_scaling, fill_values)."""
-    fv = X_raw.median()
+    fv = X_raw.median()                     # median fill — robust to skew
     X  = safe_fillna(X_raw, fv)
     sc = StandardScaler()
     Xs = sc.fit_transform(X)
@@ -1044,303 +820,6 @@ def predict_row(model, scaler, use_scaling, fill_values, fcols, row):
 
 
 # =============================================================================
-# TWO-STAGE SEASONAL MOS
-# =============================================================================
-
-MIN_SEASON_ROWS = 30   # minimum days per season to train a seasonal model
-
-
-class SeasonalMOS:
-    """
-    Two-stage MOS with per-season Stage-1 blending.
-
-    STAGE 1 -- Seasonal NWP blend
-    ─────────────────────────────
-    Four Ridge models (DJF / MAM / JJA / SON), each trained only on its own
-    season's data.  Features: raw NWP temperature_2m_*_max columns only.
-
-    Solves the annual-weight problem: GFS can dominate the full-year ranking
-    but still receive low weight in MAM Chicago where it underperforms.
-
-    If a season has fewer than MIN_SEASON_ROWS rows, the annual model is used
-    as a fallback -- never crashes on short records.
-
-    STAGE 2 -- Lasso Bias Correction
-    ────────────────────────────────
-    A Lasso (L1) model trained ONLY on the residuals of Stage-1 predictions.
-    Features: cloud, humidity, wind, solar, bias_3d/14d trackers, calendar, lags.
-
-    Because Stage 2 only sees what the blend got wrong, physical/bias features
-    are no longer competing with ECMWF -- they only compete with each other.
-    Lasso zeros out city-irrelevant features rather than giving them tiny weights.
-    """
-
-    def __init__(self, alpha_s1: float = 1.0, alpha_s2: float = 0.01,
-                 oos_for_stage2: bool = True, verbose: bool = True):
-        """
-        Parameters
-        ----------
-        alpha_s1       : Ridge regularisation for Stage-1 seasonal blenders
-        alpha_s2       : Lasso regularisation for Stage-2 bias corrector
-        oos_for_stage2 : If True (default), generate OOS residuals via 5-fold
-                         CV before fitting Stage 2. Set False for walk-forward
-                         / seed folds to avoid O(n_folds * n_steps) overhead.
-        verbose        : If False, suppress all fit() print output. Used by
-                         seed_corrector and walk_forward loops.
-        """
-        self.alpha_s1       = alpha_s1
-        self.alpha_s2       = alpha_s2
-        self.oos_for_stage2 = oos_for_stage2
-        self.verbose        = verbose
-        # Stage 1: (model, scaler, fill_values) tuples keyed by season
-        self.s1_annual: tuple = None
-        self.s1_season: dict  = {}    # {"DJF": (m, sc, fv), ...}
-        self.s1_fcols:  list  = []
-        # Stage 2: Lasso on residuals
-        self.s2_model         = None
-        self.s2_scaler        = None
-        self.s2_fill_v        = None
-        self.s2_fcols:  list  = []
-
-    # ------------------------------------------------------------------
-    # Internal: fit a Ridge for Stage 1
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _fit_ridge(X_raw: pd.DataFrame, y: pd.Series, alpha: float):
-        fv = X_raw.median()
-        X  = safe_fillna(X_raw, fv)
-        sc = StandardScaler()
-        Xs = sc.fit_transform(X)
-        m  = Ridge(alpha=alpha)
-        m.fit(Xs, y)
-        return m, sc, fv
-
-    # ------------------------------------------------------------------
-    # Internal: fit Lasso / ElasticNet for Stage 2
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _fit_lasso(X_raw: pd.DataFrame, y: pd.Series, alpha: float):
-        fv = X_raw.median()
-        X  = safe_fillna(X_raw, fv)
-        sc = StandardScaler()
-        Xs = sc.fit_transform(X)
-        # ElasticNet is more stable than pure Lasso when rows < 60
-        if len(X) < 60:
-            m = ElasticNet(alpha=alpha, l1_ratio=0.7, max_iter=10000)
-        else:
-            m = Lasso(alpha=alpha, max_iter=10000)
-        m.fit(Xs, y)
-        return m, sc, fv
-
-    # ------------------------------------------------------------------
-    # Internal: single-row prediction given (model, scaler, fill_v, fcols)
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _pred(m, sc, fv, fcols, row: pd.Series) -> float:
-        X = safe_fillna(row[fcols].to_frame().T, fv)
-        return float(m.predict(sc.transform(X))[0])
-
-    # ------------------------------------------------------------------
-    # Internal: resolve season from a row
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _season_of(row: pd.Series) -> str:
-        if "season" in row.index and pd.notna(row["season"]):
-            return str(row["season"])
-        if "month" in row.index and pd.notna(row["month"]):
-            return SEASON_MAP.get(int(row["month"]), "DJF")
-        if "date" in row.index and hasattr(row["date"], "month"):
-            return SEASON_MAP.get(int(row["date"].month), "DJF")
-        return "DJF"
-
-    # ------------------------------------------------------------------
-    # fit() -- train both stages
-    # ------------------------------------------------------------------
-    def fit(self, df: pd.DataFrame) -> None:
-        log = (lambda *a, **k: print(*a, **k)) if self.verbose else (lambda *a, **k: None)
-
-        self.s1_fcols = feature_cols_stage1(df)
-        self.s2_fcols = feature_cols_stage2(df)
-
-        if not self.s1_fcols:
-            raise ValueError("No Stage-1 NWP columns found in the data.")
-
-        # ── Stage 1: annual fallback ──────────────────────────────────
-        self.s1_annual = self._fit_ridge(
-            df[self.s1_fcols], df["tmax_actual"], self.alpha_s1)
-        log(f"  [S1] Annual fallback trained on {len(df)} rows  |  "
-            f"{len(self.s1_fcols)} NWP features")
-
-        # ── Stage 1: per-season models ────────────────────────────────
-        log("\n  -- Stage-1 seasonal NWP blend weights --")
-        for season in SEASONS:
-            sub = df[df["season"] == season]
-            if len(sub) >= MIN_SEASON_ROWS:
-                m, sc, fv = self._fit_ridge(
-                    sub[self.s1_fcols], sub["tmax_actual"], self.alpha_s1)
-                self.s1_season[season] = (m, sc, fv)
-                raw   = np.abs(m.coef_)
-                total = raw.sum() or 1.0
-                w     = raw / total
-                top3  = sorted(zip(self.s1_fcols, w), key=lambda x: -x[1])[:3]
-                w_str = "  ".join(
-                    f"{c.replace('temperature_2m_','').replace('_max','')}={v:.3f}"
-                    for c, v in top3)
-                log(f"  {season} ({len(sub):>4} days): {w_str}")
-            else:
-                log(f"  {season}: only {len(sub)} rows -- using annual fallback")
-
-        # ── Stage 2 training residuals ────────────────────────────────
-        if self.oos_for_stage2:
-            log("\n  [S2] Generating OOS residuals via 5-fold cross-val...")
-            stage2_residuals = self._oos_residuals_kfold(df, n_splits=5)
-        else:
-            s1_preds = self._predict_stage1_series(df)
-            stage2_residuals = pd.Series(
-                df["tmax_actual"].values - s1_preds.values, index=df.index)
-
-        # ── Stage 2: Lasso on residuals ───────────────────────────────
-        if self.s2_fcols:
-            self.s2_model, self.s2_scaler, self.s2_fill_v = self._fit_lasso(
-                df[self.s2_fcols], stage2_residuals, self.alpha_s2)
-            kind    = type(self.s2_model).__name__
-            imp     = pd.Series(
-                np.abs(self.s2_model.coef_),
-                index=self.s2_fcols).sort_values(ascending=False)
-            nonzero = (imp > 1e-6).sum()
-            mi      = imp.max() or 1.0
-            log(f"\n  [S2] {kind} (alpha={self.alpha_s2}) on {len(df)} residuals  |  "
-                f"{nonzero}/{len(self.s2_fcols)} features non-zero")
-            log("  Top Stage-2 bias-correction features:")
-            for f_, v in imp.head(10).items():
-                bar = "X" * max(1, int(v * 28 / mi))
-                log(f"    {f_:<44} {bar} {v:.4f}")
-        else:
-            log("  [S2] No Stage-2 features available -- skipping bias correction")
-
-    # ------------------------------------------------------------------
-    # _oos_residuals_kfold
-    # Generates true out-of-sample Stage-1 residuals using time-series
-    # cross-validation (always train on past, predict on future).
-    # These residuals have realistic magnitude -- Stage 2 can learn from them.
-    # ------------------------------------------------------------------
-    def _oos_residuals_kfold(self, df: pd.DataFrame, n_splits: int = 5) -> pd.Series:
-        n        = len(df)
-        fold_sz  = n // (n_splits + 1)
-        oos_res  = pd.Series(np.nan, index=df.index, dtype=float)
-
-        for fold in range(n_splits):
-            train_end = fold_sz * (fold + 1)
-            test_end  = min(train_end + fold_sz, n)
-            train     = df.iloc[:train_end]
-            test      = df.iloc[train_end:test_end]
-            if len(test) == 0:
-                continue
-
-            # Train a temporary seasonal S1 on this fold's training data
-            temp_annual = self._fit_ridge(
-                train[self.s1_fcols], train["tmax_actual"], self.alpha_s1)
-            temp_season = {}
-            for season in SEASONS:
-                sub = train[train["season"] == season]
-                if len(sub) >= MIN_SEASON_ROWS:
-                    temp_season[season] = self._fit_ridge(
-                        sub[self.s1_fcols], sub["tmax_actual"], self.alpha_s1)
-
-            # Predict on test fold using the right seasonal model
-            for idx in test.index:
-                row    = df.loc[idx]
-                season = self._season_of(row)
-                m, sc, fv = temp_season.get(season, temp_annual)
-                pred   = self._pred(m, sc, fv, self.s1_fcols, row)
-                oos_res.loc[idx] = float(row["tmax_actual"]) - pred
-
-        # Any rows not covered by cross-val (first fold's training period)
-        # fall back to in-sample residuals — unavoidable but a small fraction
-        still_nan = oos_res.isna()
-        if still_nan.any():
-            s1_insample = self._predict_stage1_series(df.loc[still_nan])
-            oos_res.loc[still_nan] = (
-                df.loc[still_nan, "tmax_actual"].values - s1_insample.values)
-
-        oos_std = oos_res.std()
-        log = (lambda *a, **k: print(*a, **k)) if self.verbose else (lambda *a, **k: None)
-        log(f"    OOS residual std: {oos_std:.3f}C  (in-sample would have been much smaller)")
-        return oos_res
-
-    # ------------------------------------------------------------------
-    # predict_stage1_row -- seasonal Stage-1 only
-    # ------------------------------------------------------------------
-    def predict_stage1_row(self, row: pd.Series) -> float:
-        season = self._season_of(row)
-        m, sc, fv = self.s1_season.get(season, self.s1_annual)
-        return self._pred(m, sc, fv, self.s1_fcols, row)
-
-    # ------------------------------------------------------------------
-    # _predict_stage1_series -- fast vectorised Stage-1 for whole DataFrame
-    # ------------------------------------------------------------------
-    def _predict_stage1_series(self, df: pd.DataFrame) -> pd.Series:
-        out = pd.Series(np.nan, index=df.index, dtype=float)
-        for season in SEASONS:
-            mask = df["season"] == season
-            if not mask.any():
-                continue
-            m, sc, fv = self.s1_season.get(season, self.s1_annual)
-            X = safe_fillna(df.loc[mask, self.s1_fcols], fv)
-            out.loc[mask] = m.predict(sc.transform(X))
-        # Remaining NaN rows (shouldn't happen but guard anyway)
-        nan_mask = out.isna()
-        if nan_mask.any():
-            m, sc, fv = self.s1_annual
-            X = safe_fillna(df.loc[nan_mask, self.s1_fcols], fv)
-            out.loc[nan_mask] = m.predict(sc.transform(X))
-        return out
-
-    # ------------------------------------------------------------------
-    # predict_row -- full two-stage prediction
-    # ------------------------------------------------------------------
-    def predict_row(self, row: pd.Series) -> float:
-        """
-        Returns Stage-1 blend + Stage-2 Lasso correction.
-
-        STAGE-2 JUMP DAMPENING
-        ----------------------
-        On large-jump days, Stage 2 can pile on in the same direction as
-        Stage 1's already-large departure, amplifying errors when the jump
-        doesn't verify as expected (e.g. Tokyo cold snap that recovers).
-
-        Fix: when Stage 2's correction has the SAME SIGN as the forecast jump
-        (i.e. it's pushing further in the direction the models are already
-        moving aggressively), damp Stage 2 proportionally to jump size.
-        When Stage 2 OPPOSES the jump (a counter-correction), leave it alone
-        -- that's the corrector doing useful work.
-        """
-        s1 = self.predict_stage1_row(row)
-        if self.s2_model is None or not self.s2_fcols:
-            return round(s1, 1)
-
-        s2 = self._pred(self.s2_model, self.s2_scaler,
-                        self.s2_fill_v, self.s2_fcols, row)
-
-        if s2 == 0.0:
-            return round(s1, 1)
-
-        # Compute the forecast jump if we have the necessary info
-        jump = 0.0
-        if "tmax_yesterday" in row.index and pd.notna(row.get("tmax_yesterday")):
-            jump = s1 - float(row["tmax_yesterday"])
-
-        if abs(jump) >= 2.0 and np.sign(s2) == np.sign(jump):
-            # Stage 2 is piling on in the same direction as a large jump.
-            # Damp it with the same scale used by the corrector (default 2.0).
-            # This leaves counter-corrections untouched.
-            pile_on_damp = float(np.exp(-abs(jump) / 2.0))
-            s2 = s2 * pile_on_damp
-
-        return round(s1 + s2, 1)
-
-
-# =============================================================================
 # STAGE 5a: SEED WALK-FORWARD
 # Runs the last `seed_days` through expanding-window training to produce
 # honest out-of-sample errors that seed the RealtimeBiasCorrector.
@@ -1350,32 +829,44 @@ class SeasonalMOS:
 def seed_corrector(df: pd.DataFrame, seed_days: int = 14,
                    decay: float = 0.7, jump_scale: float = 2.0) -> RealtimeBiasCorrector:
     """
-    Run expanding-window prediction for the last `seed_days` days using
-    SeasonalMOS so seeded errors match the actual production model.
+    Run expanding-window prediction for the last `seed_days` days.
 
-    Each prediction is made by a model trained on ALL data BEFORE that day --
-    these are genuine out-of-sample errors.
+    Each prediction is made by a model trained on ALL data BEFORE that day,
+    so these are genuine out-of-sample errors — the model has never seen the
+    day it is predicting.
+
+    The corrector is then loaded with these real errors and is ready to apply
+    a meaningful regime correction to tomorrow's forecast.
     """
-    corr      = RealtimeBiasCorrector(window=5, min_periods=3,
-                                      decay=decay, jump_scale=jump_scale)
-    n         = len(df)
+    fc   = feature_cols(df)
+    corr = RealtimeBiasCorrector(window=5, min_periods=3, decay=decay, jump_scale=jump_scale)
+    n    = len(df)
+
+    # We need enough training data before the first seed day.
+    # Use at most the last seed_days rows, but ensure at least 60 training rows.
     min_train = 60
     start_idx = max(min_train, n - seed_days)
 
     if start_idx >= n:
-        print("  [SEED]  Not enough data to seed corrector")
+        print(f"  [SEED]  Not enough data to seed corrector")
         return corr
 
-    actual_seed_days = n - 1 - start_idx
-    print(f"  [SEED]  Running {actual_seed_days} day(s) of OOS prediction "
-          f"to seed real-time corrector (SeasonalMOS)...")
+    # Stop at n-1, NOT n.
+    # The last row of df (index n-1) is the feature row that make_forecast()
+    # uses to predict tomorrow. We have never issued a real forecast for it —
+    # its "error" would be in-sample noise, not a genuine out-of-sample error.
+    # Including it feeds a spurious data point into the corrector that biases
+    # every subsequent forecast. It's the exact cause of the sign-flip bug:
+    # the corrector was seeing a -0.2 error for the day it was about to predict.
+    seed_end = n - 1
+    print(f"  [SEED]  Running {seed_end - start_idx} day(s) of out-of-sample prediction "
+          f"to seed real-time corrector...")
 
-    for test_idx in range(start_idx, n - 1):
-        train  = df.iloc[:test_idx]
-        row    = df.iloc[test_idx]
-        mos    = SeasonalMOS(alpha_s1=1.0, alpha_s2=0.01, oos_for_stage2=False, verbose=False)
-        mos.fit(train)
-        ml_p   = mos.predict_row(row)
+    for test_idx in range(start_idx, seed_end):
+        train = df.iloc[:test_idx]
+        row   = df.iloc[test_idx]
+        m, sc, us, fv = fit_model(train[fc], train["tmax_actual"])
+        ml_p  = predict_row(m, sc, us, fv, fc, row)
         actual = float(row["tmax_actual"])
         corr.update(row["date"], ml_p, actual)
 
@@ -1392,46 +883,50 @@ def walk_forward_validate(df: pd.DataFrame,
     """
     Full expanding-window validation with real-time bias correction.
     Produces honest out-of-sample MAE for all years after the first.
-    Uses SeasonalMOS per fold so results reflect the actual production model.
     Set run_walk_forward=False in run_pipeline to skip this for speed.
     """
+    fc   = feature_cols(df)
     corr = RealtimeBiasCorrector(window=5, min_periods=3, decay=0.7, jump_scale=2.0)
     rows = []
     n    = len(df)
 
     if n <= initial_train_days:
-        print(f"  [WF]  Skipped -- need >{initial_train_days} rows, have {n}")
+        print(f"  [WF]  Skipped — need >{initial_train_days} rows, have {n}")
         return pd.DataFrame()
 
     total = n - initial_train_days
     print(f"  [WF]  {total} test days  |  initial train: {initial_train_days} days")
 
     for i, idx in enumerate(range(initial_train_days, n)):
-        train    = df.iloc[:idx]
-        row      = df.iloc[idx]
-        mos      = SeasonalMOS(alpha_s1=1.0, alpha_s2=0.01, oos_for_stage2=False, verbose=False)
-        mos.fit(train)
-        ml_p     = mos.predict_row(row)
+        train  = df.iloc[:idx]
+        row    = df.iloc[idx]
+        m, sc, us, fv = fit_model(train[fc], train["tmax_actual"])
+        ml_p   = predict_row(m, sc, us, fv, fc, row)
+        # Use last observed tmax (previous row's actual) for jump dampening,
+        # matching exactly what the production corrector does in make_forecast.
+        # Previously called corr.correction() with no args, so dampening was
+        # never applied — making walk-forward evaluate a different behaviour
+        # than production and producing a slightly optimistic MAE estimate.
         last_obs = float(df["tmax_actual"].iloc[idx - 1]) if idx > 0 else None
-        rt       = corr.correction(model_forecast=ml_p, last_observed=last_obs)
-        final    = round(ml_p + rt, 1)
-        actual   = float(row["tmax_actual"])
+        rt     = corr.correction(model_forecast=ml_p, last_observed=last_obs)
+        final  = round(ml_p + rt, 1)
+        actual = float(row["tmax_actual"])
         corr.update(row["date"], ml_p, actual)
         rows.append({"date": row["date"], "actual": actual,
                      "ml_pred": round(ml_p, 1), "rt_correction": round(rt, 1),
                      "final_pred": final,
-                     "err_ml":    round(actual - ml_p, 1),
+                     "err_ml": round(actual - ml_p, 1),
                      "err_final": round(actual - final, 1)})
         if i % 100 == 0:
             print(f"    {i}/{total}  ({100*i/total:.0f}%)")
 
-    r      = pd.DataFrame(rows)
+    r = pd.DataFrame(rows)
     mae_ml = r["err_ml"].abs().mean()
     mae_f  = r["err_final"].abs().mean()
-    w1m = (r["err_ml"].abs()    <= 1).mean() * 100
-    w1f = (r["err_final"].abs() <= 1).mean() * 100
-    w2m = (r["err_ml"].abs()    <= 2).mean() * 100
-    w2f = (r["err_final"].abs() <= 2).mean() * 100
+    w1m = (r["err_ml"].abs()    <= 1).mean()*100
+    w1f = (r["err_final"].abs() <= 1).mean()*100
+    w2m = (r["err_ml"].abs()    <= 2).mean()*100
+    w2f = (r["err_final"].abs() <= 2).mean()*100
 
     print(f"\n  Walk-forward ({len(r)} test days)")
     print(f"  {'':30s} {'ML':>8}  {'+ RT':>8}")
@@ -1485,81 +980,107 @@ def cross_validate(df: pd.DataFrame, n_splits: int = 5) -> dict:
 
 
 # =============================================================================
-# STAGE 5d: FINAL MODEL -- trains SeasonalMOS on full historical data
+# STAGE 5d: FINAL MODEL
 # =============================================================================
 
-def train_final(df: pd.DataFrame) -> SeasonalMOS:
-    """
-    Train the production SeasonalMOS on the entire historical DataFrame.
-    Returns the fitted SeasonalMOS object -- a single object that contains
-    all seasonal Stage-1 blenders and the Stage-2 Lasso corrector.
-    """
-    mos = SeasonalMOS(alpha_s1=1.0, alpha_s2=0.01)
-    mos.fit(df)
-    return mos
+def train_final(df: pd.DataFrame):
+    fc = feature_cols(df)
+    m, sc, us, fv = fit_model(df[fc], df["tmax_actual"])
+    kind = "GBM" if not us else "Ridge"
+    print(f"  [TRAIN] {kind} on {len(df)} days  |  {len(fc)} features")
+
+    imp = pd.Series(
+        m.feature_importances_ if hasattr(m, "feature_importances_") else np.abs(m.coef_),
+        index=fc).sort_values(ascending=False)
+    print(f"\n  Top 8 features:")
+    mi = imp.max()
+    for f_, v in imp.head(8).items():
+        bar = "X" * max(1, int(v * 28 / mi))
+        print(f"    {f_:<44} {bar} {v:.4f}")
+
+    return m, sc, us, fv, fc
 
 
 # =============================================================================
 # STAGE 6: FORECAST
 # =============================================================================
 
-def make_forecast(mos: SeasonalMOS,
+def make_forecast(model, scaler, use_scaling, fill_values, fc,
                   fd, mo_raw, timezone, target_date, corrector, error_series):
     """
-    Build a synthetic "tomorrow" row and predict its temperature using
-    the two-stage SeasonalMOS.
+    Build a synthetic "tomorrow" row and predict its temperature.
 
     WHY THIS IS NECESSARY
     ---------------------
-    fd only contains dates where BOTH METAR and model data exist. Since METAR
-    has no tomorrow, fd ends at today. Predicting fd.iloc[-1] directly would
-    use today's NWP forecasts, not tomorrow's.
+    The paired DataFrame (fd) only contains dates where BOTH METAR and model
+    data exist. Since METAR has no tomorrow, fd ends at today. If we used
+    fd.iloc[-1] directly we would be predicting today not tomorrow — the model
+    features would be today's NWP forecasts, not tomorrow's.
 
     THE CORRECT APPROACH
     --------------------
-      A) NWP columns   → tomorrow's row (get_tomorrow_model_row)
-      B) Lag/bias cols → carried from today's fd row (METAR-derived actuals)
-      C) Derived/cal   → recomputed fresh for tomorrow's date
+    Two separate data sources are needed:
+      - Model columns  : tomorrow's row in od (the daily_model output).
+                         This is the date fd ends at + 1. It exists in od
+                         because NWP models always forecast ahead.
+      - Lag features   : computed from fd (METAR-based actuals up to today).
+                         tmax_yesterday, tmax_2days_ago, temp_trend_3day,
+                         and all bias_* features come from here.
+      - Derived features: recomputed from the tomorrow model row + today's lags.
+                         forecast_anomaly, model_spread, clear_calm_index, etc.
 
     Parameters
     ----------
-    mos         : fitted SeasonalMOS object (from train_final)
     fd          : paired + featured DataFrame, ends at today
-    mo_raw      : raw model forecast DataFrame (includes tomorrow)
-    timezone    : IANA timezone string
-    target_date : str "YYYY-MM-DD" -- the date being predicted (tomorrow)
-    corrector   : RealtimeBiasCorrector
-    error_series: pd.Series of historical prediction errors (for CI width)
+    od          : daily_model output (model-only daily rows), includes tomorrow
+    target_date : str "YYYY-MM-DD" — the date being predicted (tomorrow)
     """
+    import warnings
+
+    # ── 1. Get tomorrow's model row from raw hourly data ─────────────────────
+    # get_tomorrow_model_row() bypasses the >= 20 obs filter so it works even
+    # when tomorrow has only a few hours of data in the model download window.
+    # target_ts is used later for calendar features.
     target_ts = pd.Timestamp(target_date)
     tom       = get_tomorrow_model_row(mo_raw, timezone, target_date)
     today     = fd.iloc[-1]
-
-    # Build the synthetic forecast row from tomorrow's NWP values
+    # ── 2. Build the synthetic forecast row ──────────────────────────────────
+    # Start from a clean dict so we have full control over every feature.
+    # Three categories of features need different sources:
+    #
+    #   A) Tomorrow's NWP values  → from tom (tomorrow's model row in od)
+    #   B) Lag / bias features    → from fd (today's paired row — METAR-derived)
+    #   C) Derived / calendar     → computed fresh
     row = tom.copy()
+    today = fd.iloc[-1]
 
-    # ── A) Lag features from METAR actuals up to today ───────────────────────
-    row["tmax_yesterday"]  = float(fd["tmax_actual"].iloc[-1])
-    row["tmax_2days_ago"]  = float(fd["tmax_actual"].iloc[-2])
-    row["temp_trend_3day"] = float(fd["tmax_actual"].iloc[-3:].mean())
+    # ── A) Lag features (from METAR actuals up to today) ─────────────────────
+    # build_features defines these via .shift() on tmax_actual:
+    #   tmax_yesterday  = shift(1) → for tomorrow's row = today's actual
+    #   tmax_2days_ago  = shift(2) → yesterday's actual
+    #   temp_trend_3day = rolling(3).mean().shift(1) → mean of today, yesterday, day before
+    row["tmax_yesterday"]  = float(fd["tmax_actual"].iloc[-1])    # today
+    row["tmax_2days_ago"]  = float(fd["tmax_actual"].iloc[-2])    # yesterday
+    row["temp_trend_3day"] = float(fd["tmax_actual"].iloc[-3:].mean())  # 3-day mean
 
-    # ── B) Bias / anomaly features -- carry forward from today's fd row ────────
-    # Rolling error means have no tomorrow value, so we use today's as the best
-    # available estimate of the current model bias state.
-    all_fc = mos.s1_fcols + mos.s2_fcols
-    for col in all_fc:
-        if (col.startswith("bias_3d_") or col.startswith("bias_14d_")
-                or col == "forecast_anomaly"):
+    # ── B) Bias and anomaly features (carried from today's fd row) ────────────
+    # These are rolling means of past errors — tomorrow has no actual yet so
+    # we carry today's computed values forward unchanged.
+    for col in fc:
+        if (col.startswith("bias_3d_") or col.startswith("bias_14d_") or
+                col == "forecast_anomaly"):
             if col in today.index and pd.notna(today[col]):
                 row[col] = today[col]
 
     # ── C) Derived features recomputed from tomorrow's NWP values ─────────────
+    # model_max_spread: max minus min across all model temperature columns
     tm_cols = [f"temperature_2m_{m}_max" for m in MODELS
                if f"temperature_2m_{m}_max" in row.index]
     if len(tm_cols) >= 2:
         vals = [row[c] for c in tm_cols if pd.notna(row.get(c))]
-        row["model_max_spread"] = (max(vals) - min(vals)) if len(vals) >= 2 else 0.0
+        row["model_max_spread"] = max(vals) - min(vals) if len(vals) >= 2 else 0.0
 
+    # clear_calm_index and effective_solar use tomorrow's cloud/wind/solar/humidity
     cloud    = row.get("cloud_cover_forecast", 50)
     wind     = row.get("wind_forecast", 5)
     solar    = row.get("solar_ghi_forecast", 0)
@@ -1567,14 +1088,13 @@ def make_forecast(mos: SeasonalMOS,
     row["clear_calm_index"] = (100 - cloud) / (wind + 1)
     row["effective_solar"]  = solar * (1 - humidity / 200)
 
-    # Calendar features for tomorrow
+    # Calendar features for tomorrow's date
     row["day_of_year"] = target_ts.dayofyear
     row["month"]       = target_ts.month
-    row["season"]      = SEASON_MAP.get(int(target_ts.month), "DJF")
 
-    # ── Predict via two-stage SeasonalMOS ─────────────────────────────────────
-    ml_p          = mos.predict_row(row)
-    last_observed = float(fd["tmax_actual"].iloc[-1])
+    # ── 3. Predict ───────────────────────────────────────────────────────────
+    ml_p          = predict_row(model, scaler, use_scaling, fill_values, fc, row)
+    last_observed = float(fd["tmax_actual"].iloc[-1])   # today's observed tmax
 
     rt    = corrector.correction(model_forecast=ml_p, last_observed=last_observed)
     final = round(ml_p + rt, 1)
@@ -1594,8 +1114,8 @@ def make_forecast(mos: SeasonalMOS,
                                    last_observed=last_observed),
         "insample_bias":       round(eb, 2),
         "error_std":           round(es, 2),
-        "ci_80": (round(final - 1.28 * es, 1), round(final + 1.28 * es, 1)),
-        "ci_95": (round(final - 1.96 * es, 1), round(final + 1.96 * es, 1)),
+        "ci_80": (round(final - 1.28*es, 1), round(final + 1.28*es, 1)),
+        "ci_95": (round(final - 1.96*es, 1), round(final + 1.96*es, 1)),
     }
 
 
@@ -1690,6 +1210,7 @@ def run_pipeline(
 
     print("\n[4] FEATURES")
     fd = build_features(pd_)
+    fc = feature_cols(fd)
 
     # Walk-forward (full, optional)
     wf = pd.DataFrame()
@@ -1701,19 +1222,26 @@ def run_pipeline(
     print("\n[5b] CROSS-VALIDATION (diagnostic)")
     cv = cross_validate(fd)
 
-    # Final model on full data -- returns a SeasonalMOS object
+    # Final model on full data
     print("\n[5c] FINAL MODEL")
-    mos = train_final(fd)
+    model, scaler, use_sc, fill_v, fc = train_final(fd)
 
     # -----------------------------------------------------------------------
-    # [5d] CORRECTOR -- load persisted real errors OR seed from walk-forward
+    # [5d] CORRECTOR — load persisted real errors OR seed from walk-forward
+    #
+    # The corrector must track errors from the ACTUAL issued forecasts, not
+    # from throwaway mini-models. Each run saves its state; the next run loads
+    # it so the corrector accumulates genuine day-by-day operational errors.
+    #
+    # First run ever (no saved state): fall back to walk-forward seeding so
+    # the corrector has something reasonable to start with.
     # -----------------------------------------------------------------------
-    print("\n[5d] CORRECTOR")
+    print(f"\n[5d] CORRECTOR")
     corrector = load_corrector(city, data_folder,
                                decay=corrector_decay,
                                jump_scale=corrector_jump_scale)
     if corrector is None:
-        print(f"  No saved state found -- seeding from walk-forward "
+        print(f"  No saved state found — seeding from walk-forward "
               f"(last {corrector_seed_days} days OOS)")
         corrector = seed_corrector(fd, seed_days=corrector_seed_days,
                                    decay=corrector_decay,
@@ -1721,69 +1249,67 @@ def run_pipeline(
     else:
         print(f"  [CORRECTOR] State: {corrector.summary()}")
 
-    # Error series for CI width.
-    # Walk-forward errors are honest (OOS). Fallback is in-sample Stage-1+2
-    # residuals from the fitted SeasonalMOS.
+    # Error series for CI width
+    # If walk-forward ran, use those honest errors. Otherwise use in-sample.
     if len(wf) > 0:
         err_series = wf["err_final"]
-        print(f"\n  CI width from walk-forward errors (honest): "
-              f"std={err_series.std():.2f}C")
+        print(f"\n  CI width from walk-forward errors (honest): std={err_series.std():.2f}C")
     else:
-        s1_preds = mos._predict_stage1_series(fd)
-        if mos.s2_model is not None and mos.s2_fcols:
-            X_s2   = safe_fillna(fd[mos.s2_fcols], mos.s2_fill_v)
-            s2_cor = mos.s2_model.predict(mos.s2_scaler.transform(X_s2))
-            pall   = s1_preds.values + s2_cor
-        else:
-            pall = s1_preds.values
+        Xall  = safe_fillna(fd[fc], fill_v)
+        pall  = model.predict(scaler.transform(Xall) if use_sc else Xall)
         err_series = pd.Series(fd["tmax_actual"].values - pall)
 
-    # Log today's error into the corrector
-    last_completed_row  = fd.iloc[-1].copy()
-    latest_ml_pred      = mos.predict_row(last_completed_row)
-    latest_actual       = float(last_completed_row["tmax_actual"])
-    latest_date_str     = last_completed_row["date"].strftime("%Y-%m-%d")
-    # Compute the jump that was in effect for this day (for adaptation)
-    prev_actual = float(fd["tmax_actual"].iloc[-2]) if len(fd) >= 2 else latest_ml_pred
-    latest_jump = abs(latest_ml_pred - prev_actual)
-    corrector.update(latest_date_str, latest_ml_pred, latest_actual,
-                     forecast_jump=latest_jump)
-    print(f"\n  [CORRECTOR] Logged live error ({latest_date_str}): "
-          f"Pred {latest_ml_pred:.1f}C  Actual {latest_actual:.1f}C  "
-          f"Error {latest_actual - latest_ml_pred:+.1f}C")
-
     # -----------------------------------------------------------------------
-    # Steps 6 & 7 -- load market data, forecast, bet recommendations
+    # Step 6 & 7 – load market data, forecast, bet recommendations
+    # The local tomorrow date drives:
+    #   a) the section header  b) the market CSV path
+    # We use local time (not UTC) because the pipeline skips the last partial
+    # METAR day and some cities are still on "today" in UTC at run time.
     # -----------------------------------------------------------------------
+    # Derive target date from the last paired training row, not the system clock.
+    # fd["date"] is already in local time (daily_metar/daily_model convert it).
     target_date = get_target_date(fd)
 
     print("\n[MARKET] Loading buckets and prices from market CSV ...")
     buckets, market_prices = load_market_data(city, timezone, target_date, data_folder)
 
+    # Fall back to simulation only when the market file is genuinely absent
     if buckets is None:
-        buckets = sorted(set(range(18, 40)))
+        buckets = sorted(set(range(18, 40)))   # broad default — never used in production
         raw = {b: np.random.uniform(0.05, 0.35) for b in buckets}
         tot = sum(raw.values())
         market_prices = {b: round(v / tot, 3) for b, v in raw.items()}
-        print("  (Using simulated buckets and prices -- no market file found)")
+        print("  (Using simulated buckets and prices — no market file found)")
+
+    last_completed_row = fd.iloc[-1].copy()
+    latest_ml_pred = predict_row(model, scaler, use_sc, fill_v, fc, last_completed_row)
+    latest_actual = float(last_completed_row["tmax_actual"])
+    latest_date_str = last_completed_row["date"].strftime("%Y-%m-%d")
+    
+    corrector.update(latest_date_str, latest_ml_pred, latest_actual)
+    print(f"\n  [CORRECTOR] Logged live error ({latest_date_str}): Pred {latest_ml_pred:.1f}C vs Actual {latest_actual:.1f}C -> Error {latest_actual - latest_ml_pred:+.1f}C")
+    # -----------------------------------------------------------------------
 
     print(f"\n[6] FORECAST FOR {target_date}")
-    pred = make_forecast(mos, fd, mo, timezone, target_date, corrector, err_series)
+    pred = make_forecast(model, scaler, use_sc, fill_v, fc,
+                         fd, mo, timezone, target_date, corrector, err_series)
 
     print(f"\n  Target date          : {target_date}")
     print(f"  ML model forecast    : {pred['ml_forecast']}C")
     print(f"  Last observed tmax   : {pred['last_observed_tmax']}C")
     print(f"  Forecast jump        : {pred['forecast_jump']:+.1f}C")
-    print("  ------------------------------------------")
+    print(f"  ──────────────────────────────────────────────")
     print(f"  Corrector detail     : {pred['corrector_summary']}")
     print(f"  Real-time correction : {pred['realtime_correction']:+.2f}C")
-    print("  ------------------------------------------")
+    print(f"  ──────────────────────────────────────────────")
     print(f"  Final forecast       : {pred['final_forecast']}C")
     print(f"  Error std (1 sigma)  : +/-{pred['error_std']}C")
-    print(f"  80% CI               : {pred['ci_80'][0]}C - {pred['ci_80'][1]}C")
-    print(f"  95% CI               : {pred['ci_95'][0]}C - {pred['ci_95'][1]}C")
+    print(f"  80% CI               : {pred['ci_80'][0]}C – {pred['ci_80'][1]}C")
+    print(f"  95% CI               : {pred['ci_95'][0]}C – {pred['ci_95'][1]}C")
 
     print(f"\n[7] BET RECOMMENDATION  ({target_date})")
+    # bucket_probs works in Celsius — buckets are already in C (load_market_data
+    # converts F->C for American cities so everything here is always Celsius)
     probs = bucket_probs(pred["final_forecast"], pred["error_std"], buckets)
 
     print(f"\n  {'Bucket':<6} {'ML%':>7}  {'Market%':>8}  {'Edge':>7}  Action")
@@ -1804,6 +1330,21 @@ def run_pipeline(
     else:
         print("\n  No bets above edge threshold.")
 
+    # Save corrector state so the next run has a starting point.
+    # IMPORTANT: this saves the pre-forecast state — the corrector does NOT yet
+    # know today's actual tmax. After the real tmax is observed, you MUST call:
+    #
+    #   update_and_save_corrector(
+    #       result["corrector"],
+    #       forecast_date = target_date,
+    #       ml_prediction = result["forecast"]["ml_forecast"],
+    #       actual_tmax   = <observed tmax>,
+    #       city          = city,
+    #       data_folder   = data_folder,
+    #   )
+    #
+    # Without this call the corrector never accumulates real operational errors
+    # and will keep re-seeding from mini-models on every run.
     save_corrector(corrector, city, data_folder)
     print(f"  [CORRECTOR] Reminder: call update_and_save_corrector() once "
           f"today's actual tmax for {target_date} is observed.")
@@ -1812,10 +1353,11 @@ def run_pipeline(
     print("  Done.")
     print("=" * 65)
 
-    return {"mos": mos, "corrector": corrector,
-            "wf_results": wf, "cv_results": cv,
-            "forecast": pred, "paired_df": pd_, "featured_df": fd,
-            "bets": bets, "target_date": target_date}
+    return {"model": model, "scaler": scaler, "use_scaling": use_sc,
+            "fill_values": fill_v, "feature_cols": fc,
+            "corrector": corrector, "wf_results": wf, "cv_results": cv,
+            "forecast": pred, "paired_df": pd_, "featured_df": fd, "bets": bets,
+            "target_date": target_date}
 
 
 # =============================================================================
@@ -1824,54 +1366,6 @@ def run_pipeline(
 
 if __name__ == "__main__":
 
-    # Lucknow
-#     cities = [
-#     {"name": "beijing", "station": "ZBAA", "timezone": "Asia/Shanghai"},
-#     {"name": "london", "station": "EGLC", "timezone": "Europe/London"},
-#     {"name": "tokyo", "station": "RJTT", "timezone": "Asia/Tokyo"},
-#     {"name": "lucknow", "station": "VILK", "timezone": "Asia/Kolkata"},
-#     {"name": "mexico-city", "station": "MMMX", "timezone": "America/Mexico_City"},
-#     {"name": "nyc", "station": "LGA", "timezone": "America/New_York"},
-#     {"name": "toronto", "station": "CYYZ", "timezone": "America/Toronto"},
-#     {"name": "chicago", "station": "ORD", "timezone": "America/Chicago"},
-#     {"name": "atlanta", "station": "ATL", "timezone": "America/New_York"},
-#     {"name": "dallas", "station": "DAL", "timezone": "America/Chicago"},
-#     {"name": "denver", "station": "BKF", "timezone": "America/Denver"},
-#     {"name": "san-francisco", "station": "SFO", "timezone": "America/Los_Angeles"},
-#     {"name": "houston", "station": "HOU", "timezone": "America/Chicago"},
-#     {"name": "miami", "station": "MIA", "timezone": "America/New_York"},
-#     {"name": "los-angeles", "station": "LAX", "timezone": "America/Los_Angeles"},
-#     {"name": "austin", "station": "AUS", "timezone": "America/Chicago"},
-#     {"name": "seattle", "station": "SEA", "timezone": "America/Los_Angeles"},
-#     {"name": "panama-city", "station": "MPMG", "timezone": "America/Panama"},
-#     {"name": "sao-paulo", "station": "SBGR", "timezone": "America/Sao_Paulo"},
-#     {"name": "buenos-aires", "station": "SAEZ", "timezone": "America/Argentina/Buenos_Aires"},
-#     {"name": "wellington", "station": "NZWN", "timezone": "Pacific/Auckland"},
-#     {"name": "jakarta", "station": "WIHH", "timezone": "Asia/Jakarta"},
-#     {"name": "seoul", "station": "RKSI", "timezone": "Asia/Seoul"},
-#     {"name": "singapore", "station": "WSSS", "timezone": "Asia/Singapore"},
-#     {"name": "hong-kong", "station": "VHHH", "timezone": "Asia/Hong_Kong"},
-#     {"name": "shanghai", "station": "ZSPD", "timezone": "Asia/Shanghai"},
-#     {"name": "taipei", "station": "RCSS", "timezone": "Asia/Taipei"},
-#     {"name": "kuala-lumpur", "station": "WMKK", "timezone": "Asia/Kuala_Lumpur"},
-#     {"name": "chongqing", "station": "ZUCK", "timezone": "Asia/Shanghai"},
-#     {"name": "chengdu", "station": "ZUUU", "timezone": "Asia/Shanghai"},
-#     {"name": "busan", "station": "RKPK", "timezone": "Asia/Seoul"},
-#     {"name": "cape-town", "station": "FACT", "timezone": "Africa/Johannesburg"},
-#     {"name": "lagos", "station": "DNMM", "timezone": "Africa/Lagos"},
-#     {"name": "jeddah", "station": "OEJN", "timezone": "Asia/Riyadh"},
-#     {"name": "tel-aviv", "station": "LLBG", "timezone": "Asia/Jerusalem"},
-#     {"name": "munich", "station": "EDDM", "timezone": "Europe/Berlin"},
-#     {"name": "paris", "station": "LFPB", "timezone": "Europe/Paris"},
-#     {"name": "ankara", "station": "LTAC", "timezone": "Europe/Istanbul"},
-#     {"name": "istanbul", "station": "LTFM", "timezone": "Europe/Istanbul"},
-#     {"name": "moscow", "station": "UUEE", "timezone": "Europe/Moscow"},
-#     {"name": "madrid", "station": "LEMD", "timezone": "Europe/Madrid"},
-#     {"name": "helsinki", "station": "EFHK", "timezone": "Europe/Helsinki"},
-#     {"name": "amsterdam", "station": "EHAM", "timezone": "Europe/Amsterdam"},
-#     {"name": "warsaw", "station": "EPWA", "timezone": "Europe/Warsaw"},
-#     {"name": "milan", "station": "LIMC", "timezone": "Europe/Rome"}
-# ]
     all_city_names = [c["name"] for c in cities]
 
     city_name = sys.argv[1]
@@ -1892,16 +1386,5 @@ if __name__ == "__main__":
         data_folder         = "mos_data",
         initial_train_days  = 1400,
         run_walk_forward    = False,   # set True for full diagnostic (slow)
-        corrector_seed_days = 30,      # increase to 30 for more stable seeding
+        corrector_seed_days = 14,      # increase to 30 for more stable seeding
     )
-
-    # Madrid
-    # result = run_pipeline(
-    #     station             = "LEMD",
-    #     city                = "madrid",
-    #     timezone            = "Europe/Madrid",
-    #     data_folder         = "mos_data",
-    #     initial_train_days  = 365,
-    #     run_walk_forward    = False,
-    #     corrector_seed_days = 14,
-    # )
