@@ -200,7 +200,9 @@ class RealtimeBiasCorrector:
         Optionally record the forecast_jump that was in effect, so
         adapt_jump_scale() can measure whether dampening actually helped.
         """
-        date_str  = str(date)
+        # Always normalise to "YYYY-MM-DD" so pd.Timestamp dates ("2026-04-26 00:00:00")
+        # and plain-string dates ("2026-04-26") share the same dict key.
+        date_str  = pd.Timestamp(date).strftime("%Y-%m-%d")
         new_error = float(actual) - float(ml_prediction)
 
         # Rolling window (used for correction)
@@ -397,8 +399,16 @@ class RealtimeBiasCorrector:
                   min_periods = state["min_periods"],
                   decay       = state.get("decay",      0.7),
                   jump_scale  = state.get("jump_scale", 2.0))
-        obj._history      = list(state["history"])
-        obj._long_history = list(state.get("long_history", []))
+        # Normalise all date strings to "YYYY-MM-DD" on load so old JSON files
+        # that stored "2026-04-26 00:00:00" are migrated to the canonical format.
+        obj._history = [
+            (pd.Timestamp(d).strftime("%Y-%m-%d"), e)
+            for d, e in state["history"]
+        ]
+        obj._long_history = [
+            (pd.Timestamp(d).strftime("%Y-%m-%d"), e, j)
+            for d, e, j in state.get("long_history", [])
+        ]
         return obj
 
 
@@ -483,12 +493,28 @@ def to_local(series: pd.Series, tz_name: str) -> pd.Series:
     return s.dt.tz_convert(tz).dt.tz_localize(None)
 
 
-# American timezone prefixes -- markets for these cities use Fahrenheit
-_AMERICAN_TZ_PREFIXES = ("America/", "US/", "Pacific/Honolulu")
+# Explicit US-only timezones whose Polymarket buckets are in Fahrenheit.
+# America/ covers the whole western hemisphere so we must NOT use a prefix
+# match -- that would wrongly flag Toronto, Sao Paulo, Buenos Aires, Panama,
+# Mexico City etc. whose markets are all in Celsius.
+_US_TIMEZONES = {
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Phoenix",
+    "America/Anchorage",
+    "America/Honolulu",
+    "US/Eastern",
+    "US/Central",
+    "US/Mountain",
+    "US/Pacific",
+    "Pacific/Honolulu",
+}
 
 def is_fahrenheit_city(timezone: str) -> bool:
-    """Return True for cities whose market buckets are in Fahrenheit (US cities)."""
-    return timezone.startswith(_AMERICAN_TZ_PREFIXES)
+    """Return True ONLY for US cities whose market buckets are in Fahrenheit."""
+    return timezone in _US_TIMEZONES
 
 
 def c_to_f(c: float) -> int:
@@ -600,7 +626,12 @@ def load_market_data(city: str, timezone: str,
             continue
         temp_raw = int(nums[0])
 
-        # --- For American cities: CSV is in °F, convert back to °C ---
+        # --- For US cities: CSV titles are in °F, convert to °C for internal use ---
+        # The MOS always works in Celsius internally. For US markets the bucket
+        # labels in the CSV are Fahrenheit integers (e.g. 75 means 75°F).
+        # We convert to the nearest Celsius integer for internal storage.
+        # The display layer (run_pipeline bet table) prints °F labels for US cities
+        # by calling c_to_f() on the stored Celsius key.
         if fahrenheit:
             temp_c = round((temp_raw - 32) * 5 / 9)
         else:
@@ -669,9 +700,62 @@ def load_model_forecasts(city: str, data_folder: str = "mos_data") -> pd.DataFra
     return df.sort_values("date").reset_index(drop=True)
 
 
-# =============================================================================
-# STAGE 2: CLEAN
-# =============================================================================
+def load_max_summary(station: str, data_folder: str = "mos_data") -> pd.DataFrame:
+    """
+    Load the daily summary CSV from mos_data/max_metar/<station>.csv.
+
+    This file contains non-rounded daily max/min values sourced from ASOS
+    daily summaries. All temperature and feel columns are in Fahrenheit and
+    are converted to Celsius here so the rest of the pipeline is always in C.
+
+    Columns used downstream (after conversion):
+        max_temp_c      -- non-rounded daily tmax in Celsius (replaces METAR tmpc max)
+        max_dewpoint_c  -- daily max dewpoint in Celsius
+        precip_in       -- daily precipitation in inches (kept as-is, flag only)
+        avg_wind_speed_kts
+        avg_wind_drct   -- average wind direction in degrees (0-360)
+        avg_rh          -- average relative humidity %
+        srad_mj         -- solar radiation in MJ/m2
+        avg_feel_c      -- average apparent temperature in Celsius
+        max_wind_gust_kts
+
+    Returns empty DataFrame if the file does not exist -- daily_metar() falls
+    back to the rounded METAR tmax gracefully when this is the case.
+    """
+    path = Path(data_folder) / "max_metar" / f"{station}.csv"
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+    df["day"] = pd.to_datetime(df["day"]).dt.date
+
+    def f_to_c(series: pd.Series) -> pd.Series:
+        return (series - 32) * 5 / 9
+
+    # Convert all Fahrenheit temperature/feel columns to Celsius
+    for f_col, c_col in [
+        ("max_temp_f",      "max_temp_c"),
+        ("min_temp_f",      "min_temp_c"),
+        ("max_dewpoint_f",  "max_dewpoint_c"),
+        ("min_dewpoint_f",  "min_dewpoint_c"),
+        ("min_feel",        "min_feel_c"),
+        ("avg_feel",        "avg_feel_c"),
+        ("max_feel",        "max_feel_c"),
+    ]:
+        if f_col in df.columns:
+            df[c_col] = f_to_c(pd.to_numeric(df[f_col], errors="coerce"))
+
+    # Keep non-temperature columns as-is
+    keep = ["day", "max_temp_c", "min_temp_c", "max_dewpoint_c", "min_dewpoint_c",
+            "precip_in", "avg_wind_speed_kts", "avg_wind_drct",
+            "min_rh", "avg_rh", "max_rh",
+            "avg_feel_c", "min_feel_c", "max_feel_c",
+            "max_wind_speed_kts", "max_wind_gust_kts", "srad_mj"]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].copy()
+
+    print(f"  [MAX_SUMMARY] Loaded {len(df)} rows from {path.name}")
+    return df
 
 def clean_metar(df, tmin=-40., tmax=60.):
     n = len(df)
@@ -700,39 +784,110 @@ def clean_model(df, tmin=-40., tmax=60.):
 # STAGE 3: ALIGN AND PAIR
 # =============================================================================
 
-def daily_metar(metar_df, station, tz):
+def daily_metar(metar_df, station, tz, max_summary_df: pd.DataFrame = None):
+    """
+    Aggregate hourly METAR observations into daily rows.
+
+    PEAK WINDOW
+    -----------
+    Previously hardcoded to 11-15 local time. This is wrong for high-latitude
+    summer cities, tropical cities with early convective cooling, and cities
+    with strong sea breezes. Fix: use the data-driven peak hour (hour of
+    tmax_actual) and build a symmetric +/-2 hour window around it.
+    Fallback to full day if the window is empty.
+
+    TMAX SOURCE PRIORITY
+    --------------------
+    1. max_summary_df (non-rounded daily max from ASOS summary) -- preferred
+    2. METAR hourly tmpc max -- fallback when summary not available
+
+    NEW COLUMNS FROM DAILY SUMMARY (when max_summary_df provided)
+    --------------------------------------------------------------
+    tmax_actual       -- non-rounded (replaces rounded METAR value)
+    max_dewpoint_c    -- daily max dewpoint in Celsius
+    precip_daily_in   -- daily precipitation in inches
+    avg_wind_drct     -- average wind direction degrees (0-360)
+    avg_rh_obs        -- average observed relative humidity %
+    daily_solar_mj    -- solar radiation MJ/m2
+    avg_feel_c        -- average apparent temperature in Celsius
+    max_wind_gust_kts -- daily max wind gust in knots
+    """
     df = metar_df[metar_df["station"] == station].copy()
     df["lt"] = to_local(df["valid"], tz)
     df["ld"] = df["lt"].dt.date
+
+    # Build a lookup dict from daily summary keyed by date for O(1) access
+    summary_by_date = {}
+    if max_summary_df is not None and len(max_summary_df) > 0:
+        for _, sr in max_summary_df.iterrows():
+            summary_by_date[sr["day"]] = sr
+
     rows = []
     for d, g in df.groupby("ld"):
-        # Require >= 20 observations for a complete day.
-        # Exception: the most recent local date may be partial (today still in
-        # progress). Keep it regardless of obs count so its tmax_actual feeds
-        # the corrector seeder. Without this, cities like Wellington (UTC+12)
-        # always lag one day behind because today's local date never accumulates
-        # 20 obs before the pipeline runs.
-        # is_last = (d == last_date)
-        if len(g) < 20 : # if len(g) < 20 and not is_last:
+        # Two-level threshold:
+        #   < 4 obs  → truly unusable (skip entirely)
+        #   < 20 obs → partial day: kept for corrector seeding but excluded from
+        #              training via the is_partial flag that pair() filters out.
+        # Previously this was a single "< 14: continue" which made is_partial
+        # always False (dead code) and silently dropped recent partial days that
+        # are needed for the corrector seeder — especially for Asian timezones
+        # where the local day is ahead of UTC collection time.
+        if len(g) < 4:
             continue
-        idx      = g["tmpc"].idxmax()
-        peak     = g[g["lt"].dt.hour.between(11, 15)]
-        if len(peak) == 0: peak = g
-        cloud    = peak["skyc1"].map(SKY_MAP).fillna(50).mean()
-        rows.append({
+
+        # --- Data-driven peak hour (not hardcoded 11-15) ---
+        idx     = g["tmpc"].idxmax()
+        peak_hr = int(g.loc[idx, "lt"].hour)
+
+        # Symmetric 2-hour window around the observed tmax hour
+        lo   = max(0,  peak_hr - 2)
+        hi   = min(23, peak_hr + 2)
+        peak = g[g["lt"].dt.hour.between(lo, hi)]
+        if len(peak) == 0:
+            peak = g
+
+        cloud = peak["skyc1"].map(SKY_MAP).fillna(50).mean()
+
+        row = {
             "date":             pd.Timestamp(d),
-            "tmax_actual":      round(float(g.loc[idx, "tmpc"]), 1),
-            "tmax_hour_local":  int(g.loc[idx, "lt"].hour),
+            "tmax_actual":      round(float(g.loc[idx, "tmpc"]), 1),  # METAR fallback
+            "tmax_hour_local":  peak_hr,
             "wind_at_peak":     round(float(peak["wind_kt"].mean()), 1),
             "humidity_at_peak": round(float(peak["relh"].mean()), 1),
             "cloud_at_peak":    round(float(cloud), 1),
             "obs_count":        len(g),
-            "is_partial":       len(g) < 20, # "is_partial":       is_last and len(g) < 20,
-        })
+            "is_partial":       len(g) < 20,   # partial if < 20 obs; excluded from training by pair()
+        }
+
+        # --- Enrich from daily summary when available ---
+        sr = summary_by_date.get(d)
+        if sr is not None:
+            # Override tmax_actual with non-rounded value if present
+            if pd.notna(sr.get("max_temp_c")):
+                row["tmax_actual"] = round(float(sr["max_temp_c"]), 2)
+
+            # New columns from daily summary
+            for src, dst in [
+                ("max_dewpoint_c",    "max_dewpoint_c"),
+                ("precip_in",         "precip_daily_in"),
+                ("avg_wind_drct",     "avg_wind_drct"),
+                ("avg_rh",            "avg_rh_obs"),
+                ("srad_mj",           "daily_solar_mj"),
+                ("avg_feel_c",        "avg_feel_c"),
+                ("max_wind_gust_kts", "max_wind_gust_kts"),
+            ]:
+                val = sr.get(src)
+                if val is not None and pd.notna(val):
+                    row[dst] = float(val)
+
+        rows.append(row)
+
     r = pd.DataFrame(rows)
     partial = int(r["is_partial"].sum()) if "is_partial" in r.columns else 0
+    n_enriched = sum(1 for d in r["date"].dt.date if d in summary_by_date)
     print(f"  [ALIGN] {len(r)} daily METAR records ({station})"
-          + ("  [1 partial day kept]" if partial else ""))
+          + (f"  [{n_enriched} enriched from daily summary]" if n_enriched else "")
+          + ("  [1 partial day discarded]" if partial else ""))
     return r
 
 
@@ -751,10 +906,11 @@ def daily_model(model_df, tz):
     tcols = [f"temperature_2m_{m}" for m in MODELS if f"temperature_2m_{m}" in df.columns]
     rows  = []
     for d, g in df.groupby("ld"):
-        # Strict filter: only complete days (>= 20 obs) go into the paired
-        # training data. Partial/future dates are handled separately by
-        # get_tomorrow_model_row() which reads raw hourly data directly.
-        if len(g) < 20:
+        # Use a low hard-minimum (< 4) to handle 3-hourly or 6-hourly NWP data
+        # without silently dropping recent or future forecast dates.
+        # Historical complete days always pass; tomorrow's partial NWP row is
+        # handled separately by get_tomorrow_model_row() which has no filter.
+        if len(g) < 4:
             continue
         row = {"date": pd.Timestamp(d)}
         for c in tcols: row[f"{c}_max"] = float(g[c].max())
@@ -904,6 +1060,36 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         # heat island / sea-breeze signal: apparent temp minus dry bulb
         df["heat_island_signal"] = df["feel_at_peak"] - df["tmax_actual"]
 
+    # Daily summary enrichments -- active when daily summary CSV is loaded
+    # Wind direction: decompose into U/V components so Stage 2 Lasso can learn
+    # directional effects per city (e.g. Busan offshore vs onshore).
+    # U/V let the model learn which direction matters without hardcoding it.
+    if "avg_wind_drct" in df.columns:
+        drct_rad = np.radians(pd.to_numeric(df["avg_wind_drct"], errors="coerce"))
+        # Meteorological convention: wind FROM direction, so U/V are negated
+        df["wind_u"] = -np.sin(drct_rad)   # positive = westerly component
+        df["wind_v"] = -np.cos(drct_rad)   # positive = southerly component
+
+    # Daily precipitation flag from summary (more reliable than hourly p01i)
+    if "precip_daily_in" in df.columns:
+        df["precip_daily_flag"] = (
+            pd.to_numeric(df["precip_daily_in"], errors="coerce").fillna(0) > 0.01
+        ).astype(float)
+
+    # Observed solar radiation from daily summary (better than model shortwave)
+    if "daily_solar_mj" in df.columns:
+        df["daily_solar_mj"] = pd.to_numeric(df["daily_solar_mj"], errors="coerce")
+
+    # Observed average RH from daily summary
+    if "avg_rh_obs" in df.columns:
+        df["avg_rh_obs"] = pd.to_numeric(df["avg_rh_obs"], errors="coerce")
+
+    # Heat island signal from daily summary apparent temperature
+    if "avg_feel_c" in df.columns and "tmax_actual" in df.columns:
+        df["feel_tmax_delta"] = (
+            pd.to_numeric(df["avg_feel_c"], errors="coerce") - df["tmax_actual"]
+        )
+
     df = df.dropna(subset=["tmax_yesterday", "temp_trend_3day"]).reset_index(drop=True)
     print(f"  [FEAT]  {len(df)} rows x {len(df.columns)} cols")
     return df
@@ -961,6 +1147,11 @@ def feature_cols_stage2(df: pd.DataFrame) -> list:
             c.append(col)
     # Optional METAR enrichments
     for col in ["precip_flag", "heat_island_signal"]:
+        if col in df.columns:
+            c.append(col)
+    # Daily summary enrichments (wind direction, precip, solar, RH, feel)
+    for col in ["wind_u", "wind_v", "precip_daily_flag",
+                "daily_solar_mj", "avg_rh_obs", "feel_tmax_delta"]:
         if col in df.columns:
             c.append(col)
     return c
@@ -1081,7 +1272,8 @@ class SeasonalMOS:
     """
 
     def __init__(self, alpha_s1: float = 1.0, alpha_s2: float = 0.01,
-                 oos_for_stage2: bool = True, verbose: bool = True):
+                 oos_for_stage2: bool = True, verbose: bool = True,
+                 force_annual: bool = False):
         """
         Parameters
         ----------
@@ -1092,11 +1284,14 @@ class SeasonalMOS:
                          / seed folds to avoid O(n_folds * n_steps) overhead.
         verbose        : If False, suppress all fit() print output. Used by
                          seed_corrector and walk_forward loops.
+        force_annual   : If True, skip per-season models -- Stage 1 uses only
+                         the annual model. Used for head-to-head comparison.
         """
         self.alpha_s1       = alpha_s1
         self.alpha_s2       = alpha_s2
         self.oos_for_stage2 = oos_for_stage2
         self.verbose        = verbose
+        self.force_annual   = force_annual
         # Stage 1: (model, scaler, fill_values) tuples keyed by season
         self.s1_annual: tuple = None
         self.s1_season: dict  = {}    # {"DJF": (m, sc, fv), ...}
@@ -1180,7 +1375,7 @@ class SeasonalMOS:
         log("\n  -- Stage-1 seasonal NWP blend weights --")
         for season in SEASONS:
             sub = df[df["season"] == season]
-            if len(sub) >= MIN_SEASON_ROWS:
+            if not self.force_annual and len(sub) >= MIN_SEASON_ROWS:
                 m, sc, fv = self._fit_ridge(
                     sub[self.s1_fcols], sub["tmax_actual"], self.alpha_s1)
                 self.s1_season[season] = (m, sc, fv)
@@ -1371,11 +1566,11 @@ def seed_corrector(df: pd.DataFrame, seed_days: int = 14,
         print("  [SEED]  Not enough data to seed corrector")
         return corr
 
-    actual_seed_days = n - 1 - start_idx
+    actual_seed_days = n - start_idx   # was n-1-start_idx, off by one
     print(f"  [SEED]  Running {actual_seed_days} day(s) of OOS prediction "
           f"to seed real-time corrector (SeasonalMOS)...")
 
-    for test_idx in range(start_idx, n - 1):
+    for test_idx in range(start_idx, n):   # was n-1: was skipping the last row
         train  = df.iloc[:test_idx]
         row    = df.iloc[test_idx]
         mos    = SeasonalMOS(alpha_s1=1.0, alpha_s2=0.01, oos_for_stage2=False, verbose=False)
@@ -1508,6 +1703,17 @@ def train_final(df: pd.DataFrame) -> SeasonalMOS:
     return mos
 
 
+def train_final_annual(df: pd.DataFrame) -> SeasonalMOS:
+    """
+    Train an annual-only MOS (no seasonal Stage-1 split) on the full data.
+    Used for head-to-head comparison against the seasonal model.
+    Stage 2 is identical -- only Stage 1 differs (no seasonal splits).
+    """
+    mos = SeasonalMOS(alpha_s1=1.0, alpha_s2=0.01, force_annual=True)
+    mos.fit(df)
+    return mos
+
+
 # =============================================================================
 # STAGE 6: FORECAST
 # =============================================================================
@@ -1561,6 +1767,33 @@ def make_forecast(mos: SeasonalMOS,
                 or col == "forecast_anomaly"):
             if col in today.index and pd.notna(today[col]):
                 row[col] = today[col]
+
+    # ── B2) Daily summary features -- carry forward from today's fd row ───────
+    # These come from the ASOS daily summary file (wind direction, precip,
+    # solar radiation, observed RH, apparent temperature delta). Tomorrow's
+    # summary doesn't exist yet, so we use today's as the best available proxy.
+    # wind_u / wind_v are recomputed from avg_wind_drct if present; the others
+    # are carried as-is since they represent recent climatological state.
+    _summary_carry = [
+        "wind_u", "wind_v",
+        "precip_daily_flag",
+        "daily_solar_mj",
+        "avg_rh_obs",
+        "feel_tmax_delta",
+        "max_dewpoint_c",
+        "max_wind_gust_kts",
+    ]
+    for col in _summary_carry:
+        if col in today.index and pd.notna(today[col]):
+            row[col] = today[col]
+
+    # ── B3) Ensure every Stage 2 feature exists in the row ───────────────────
+    # Any Stage 2 feature that is still missing (not in NWP data, not carried
+    # forward) must be present as NaN so safe_fillna can impute it. Without
+    # this, row[fcols] raises KeyError on missing columns.
+    for col in mos.s2_fcols:
+        if col not in row.index:
+            row[col] = np.nan
 
     # ── C) Derived features recomputed from tomorrow's NWP values ─────────────
     tm_cols = [f"temperature_2m_{m}_max" for m in MODELS
@@ -1717,14 +1950,16 @@ def run_pipeline(
     print("\n[1] LOAD")
     rm = load_metar(station, data_folder)
     mo = load_model_forecasts(city, data_folder)
-    print(f"  METAR: {len(rm):,} rows  |  Model: {len(mo):,} rows")
+    mx = load_max_summary(station, data_folder)
+    print(f"  METAR: {len(rm):,} rows  |  Model: {len(mo):,} rows"
+          + (f"  |  Max summary: {len(mx):,} rows" if len(mx) > 0 else ""))
 
     print("\n[2] CLEAN")
     rm = clean_metar(rm, temp_min, temp_max)
     mo = clean_model(mo, temp_min, temp_max)
 
     print("\n[3] ALIGN")
-    md = daily_metar(rm, station, timezone)
+    md = daily_metar(rm, station, timezone, max_summary_df=mx if len(mx) > 0 else None)
     od = daily_model(mo, timezone)
     pd_ = pair(md, od)
 
@@ -1742,8 +1977,11 @@ def run_pipeline(
     cv = cross_validate(fd)
 
     # Final model on full data -- returns a SeasonalMOS object
-    print("\n[5c] FINAL MODEL")
+    print("\n[5c] FINAL MODEL -- SEASONAL")
     mos = train_final(fd)
+
+    print("\n[5c-B] FINAL MODEL -- ANNUAL (head-to-head comparison)")
+    mos_annual = train_final_annual(fd)
 
     # -----------------------------------------------------------------------
     # [5d] CORRECTOR -- load persisted real errors OR seed from walk-forward
@@ -1760,6 +1998,45 @@ def run_pipeline(
                                    jump_scale=corrector_jump_scale)
     else:
         print(f"  [CORRECTOR] State: {corrector.summary()}")
+
+        # Catch up any fd rows that are newer than the last recorded corrector
+        # entry.  This fills the gap that appears when the pipeline runs daily
+        # but METAR data for the intervening days hadn't arrived yet: each of
+        # those runs re-logged the same stale fd tail date, leaving the real
+        # dates unrecorded.  We use an expanding-window OOS prediction (same as
+        # seed_corrector) so the errors are honest.
+        if corrector._history:
+            last_corr_date = max(
+                pd.Timestamp(d) for d, _ in corrector._history
+            )
+            missed = fd[pd.to_datetime(fd["date"]) > last_corr_date].copy()
+            if not missed.empty:
+                print(f"  [CORRECTOR] Catching up {len(missed)} missed day(s) "
+                      f"since {last_corr_date.date()} ...")
+                missed = missed.reset_index(drop=True)
+                for pos in range(len(missed)):
+                    catchup_row   = missed.iloc[pos]
+                    cutoff_date   = pd.Timestamp(catchup_row["date"])
+                    train_df      = fd[pd.to_datetime(fd["date"]) < cutoff_date].copy()
+                    if len(train_df) < 60:
+                        print(f"  [CORRECTOR] Skipping catch-up for "
+                              f"{catchup_row['date'].date()} "
+                              f"(only {len(train_df)} training rows)")
+                        continue
+                    mos_tmp = SeasonalMOS(alpha_s1=1.0, alpha_s2=0.01,
+                                         oos_for_stage2=False, verbose=False)
+                    mos_tmp.fit(train_df)
+                    cu_ml_p  = mos_tmp.predict_row(catchup_row)
+                    cu_actual = float(catchup_row["tmax_actual"])
+                    cu_date   = cutoff_date.strftime("%Y-%m-%d")
+                    # Jump = departure from the day before this one in fd
+                    prev_rows = fd[pd.to_datetime(fd["date"]) < cutoff_date]
+                    cu_prev   = float(prev_rows["tmax_actual"].iloc[-1]) if len(prev_rows) else cu_ml_p
+                    corrector.update(cu_date, cu_ml_p, cu_actual,
+                                     forecast_jump=abs(cu_ml_p - cu_prev))
+                    print(f"  [CORRECTOR] Catch-up ({cu_date}): "
+                          f"Pred {cu_ml_p:.1f}C  Actual {cu_actual:.1f}C  "
+                          f"Error {cu_actual - cu_ml_p:+.1f}C")
 
     # Error series for CI width.
     # Walk-forward errors are honest (OOS). Fallback is in-sample Stage-1+2
@@ -1778,19 +2055,28 @@ def run_pipeline(
             pall = s1_preds.values
         err_series = pd.Series(fd["tmax_actual"].values - pall)
 
-    # Log today's error into the corrector
+    # Log the last completed fd row into the corrector — but only if that date
+    # is not already present.  Without this guard, daily runs that see the same
+    # fd tail date (because new METAR hasn't arrived yet) repeatedly overwrite
+    # the same entry while the intervening real days stay unrecorded.
     last_completed_row  = fd.iloc[-1].copy()
     latest_ml_pred      = mos.predict_row(last_completed_row)
     latest_actual       = float(last_completed_row["tmax_actual"])
     latest_date_str     = last_completed_row["date"].strftime("%Y-%m-%d")
-    # Compute the jump that was in effect for this day (for adaptation)
     prev_actual = float(fd["tmax_actual"].iloc[-2]) if len(fd) >= 2 else latest_ml_pred
     latest_jump = abs(latest_ml_pred - prev_actual)
-    corrector.update(latest_date_str, latest_ml_pred, latest_actual,
-                     forecast_jump=latest_jump)
-    print(f"\n  [CORRECTOR] Logged live error ({latest_date_str}): "
-          f"Pred {latest_ml_pred:.1f}C  Actual {latest_actual:.1f}C  "
-          f"Error {latest_actual - latest_ml_pred:+.1f}C")
+
+    already_recorded = {pd.Timestamp(d).strftime("%Y-%m-%d")
+                        for d, _ in corrector._history}
+    if latest_date_str not in already_recorded:
+        corrector.update(latest_date_str, latest_ml_pred, latest_actual,
+                         forecast_jump=latest_jump)
+        print(f"\n  [CORRECTOR] Logged live error ({latest_date_str}): "
+              f"Pred {latest_ml_pred:.1f}C  Actual {latest_actual:.1f}C  "
+              f"Error {latest_actual - latest_ml_pred:+.1f}C")
+    else:
+        print(f"\n  [CORRECTOR] {latest_date_str} already in history -- "
+              f"skipping re-log (use update_and_save_corrector() to overwrite)")
 
     # -----------------------------------------------------------------------
     # Steps 6 & 7 -- load market data, forecast, bet recommendations
@@ -1808,7 +2094,8 @@ def run_pipeline(
         print("  (Using simulated buckets and prices -- no market file found)")
 
     print(f"\n[6] FORECAST FOR {target_date}")
-    pred = make_forecast(mos, fd, mo, timezone, target_date, corrector, err_series)
+    pred        = make_forecast(mos,        fd, mo, timezone, target_date, corrector, err_series)
+    pred_annual = make_forecast(mos_annual, fd, mo, timezone, target_date, corrector, err_series)
 
     print(f"\n  Target date          : {target_date}")
     print(f"  ML model forecast    : {pred['ml_forecast']}C")
@@ -1823,8 +2110,30 @@ def run_pipeline(
     print(f"  80% CI               : {pred['ci_80'][0]}C - {pred['ci_80'][1]}C")
     print(f"  95% CI               : {pred['ci_95'][0]}C - {pred['ci_95'][1]}C")
 
+    # ── Head-to-head: Seasonal vs Annual ─────────────────────────────────────
+    s_ml    = pred['ml_forecast']
+    a_ml    = pred_annual['ml_forecast']
+    s_final = pred['final_forecast']
+    a_final = pred_annual['final_forecast']
+    agree   = "AGREE" if abs(s_final - a_final) <= 0.5 else "DISAGREE"
+    winner  = ("SEASONAL" if abs(s_ml - pred['last_observed_tmax']) <
+                             abs(a_ml - pred['last_observed_tmax'])
+               else "ANNUAL")
+
+    print("\n  -- Seasonal vs Annual head-to-head --")
+    print(f"  {'':30s} {'Seasonal':>10}  {'Annual':>10}")
+    print(f"  {'Stage-1+2 ML forecast':30s} {s_ml:>9.1f}C  {a_ml:>9.1f}C")
+    print(f"  {'Final (+ RT correction)':30s} {s_final:>9.1f}C  {a_final:>9.1f}C")
+    print(f"  {'Difference':30s} {s_final - a_final:>+9.1f}C")
+    print(f"  {'Models':30s} {agree}")
+    print(f"  Note: use '{winner.lower()}' forecast if yesterday's actual "
+          f"is the only reference point")
+
     print(f"\n[7] BET RECOMMENDATION  ({target_date})")
     probs = bucket_probs(pred["final_forecast"], pred["error_std"], buckets)
+
+    fahrenheit = is_fahrenheit_city(timezone)
+    unit_label = "F" if fahrenheit else "C"
 
     print(f"\n  {'Bucket':<6} {'ML%':>7}  {'Market%':>8}  {'Edge':>7}  Action")
     print("  " + "-" * 46)
@@ -1833,13 +2142,16 @@ def run_pipeline(
         mkt  = market_prices.get(b, 0)
         e    = mp - mkt
         flag = "  BET" if abs(e) >= 0.05 else ""
-        print(f"  {b}C     {mp:>6.1%}   {mkt:>6.1%}   {e:>+6.1%}{flag}")
+        # Display bucket in native market unit for readability
+        b_label = c_to_f(b) if fahrenheit else b
+        print(f"  {b_label}{unit_label}     {mp:>6.1%}   {mkt:>6.1%}   {e:>+6.1%}{flag}")
 
     bets = bet_recs(probs, market_prices)
     if bets:
         print("\n  Recommended bets:")
         for bt in bets:
-            print(f"    {bt['action']} {bt['bucket']}C  "
+            b_label = c_to_f(bt['bucket']) if fahrenheit else bt['bucket']
+            print(f"    {bt['action']} {b_label}{unit_label}  "
                   f"edge={bt['edge']}  kelly={bt['kelly']}  {bt['confidence']}")
     else:
         print("\n  No bets above edge threshold.")
@@ -1858,7 +2170,7 @@ def run_pipeline(
     print(f"  [LOG] Run log saved -> {log_path}")
     # ─────────────────────────────────────────────────────────────────
 
-    return {"mos": mos, "corrector": corrector,
+    return {"mos": mos, "mos_annual": mos_annual, "corrector": corrector,
             "wf_results": wf, "cv_results": cv,
             "forecast": pred, "paired_df": pd_, "featured_df": fd,
             "bets": bets, "target_date": target_date}

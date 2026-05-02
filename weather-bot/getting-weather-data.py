@@ -189,4 +189,4 @@ class Weather_Data_Collection:
 weather_data = Weather_Data_Collection()
 weather_data.date_input()
 weather_data.main_run_multi_model()
-weather_data.ensemble_model()
+# weather_data.ensemble_model()

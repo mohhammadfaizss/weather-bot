@@ -21,6 +21,7 @@ BASE_DIR = script_location / "mos_data"
 
 metar_data_url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 historical_forcast_url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+max_metar_url = "https://mesonet.agron.iastate.edu/cgi-bin/request/daily.py"
 
 today = date.today()
 
@@ -124,7 +125,7 @@ class update_mos_database :
                 "data": ["tmpc", "dwpc", "relh", "skyc1", "sknt", "skyc2", "skyc3", "metar"],
                 "year1": 2026,
                 "month1": 4,
-                "day1": 20,
+                "day1": 25,
                 "year2": today.year,
                 "month2": today.month,
                 "day2": today.day,
@@ -168,8 +169,64 @@ class update_mos_database :
 
             print(f"[{city['station']}] File updated → {len(combined_df)} total rows")
 
+    def updating_max_metar(self) :
+        for city in cities :
+                params = {
+                    "network": city["network"],
+                    "station": city["station"],
+                    # "var": ["max_temp_f", "max_dewpoint_f", "precip_in", "max_rh", "max_feel", "max_wind_speed_kts", "skyc3", "metar"],
+                    "year1": 2026,
+                    "month1": 4,
+                    "day1": 1,
+                    "year2": today.year,
+                    "month2": today.month,
+                    "day2": today.day,
+                    "tz": "Etc/UTC",
+                    "format": "onlycomma",
+                    "latlon": "no",
+                    "elev": "no",
+                    "missing": "null",
+                    "trace": "T",
+                    "direct": "no",
+                    "report_type": ["1", "3", "4"]
+                }
+
+
+                response = requests.get(max_metar_url, params=params)
+
+                text = response.text.strip()
+                if not text:
+                    continue
+
+                new_df = pd.read_csv(StringIO(text))
+
+                child_folder = "max_metar"
+                
+                file_path = BASE_DIR  / child_folder / f"{city['station']}.csv"
+                
+
+                
+
+                
+                
+
+                if os.path.exists(file_path):
+                    old_df = pd.read_csv(file_path)
+
+                    # Combine + remove duplicates
+                    combined_df = pd.concat([old_df, new_df]).drop_duplicates()
+
+                else:
+                    combined_df = new_df
+
+                combined_df.to_csv(file_path, index=False)
+
+                print(f"[{city['station']}] File updated → {len(combined_df)} total rows")
+
+
 
 get_the_update = update_mos_database()
 
-# get_the_update.updating_metar()
+get_the_update.updating_max_metar()
+get_the_update.updating_metar()
 get_the_update.updating_forcast()

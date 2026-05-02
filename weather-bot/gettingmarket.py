@@ -8,26 +8,32 @@ from variable import *
 
 
 
+from datetime import datetime
+
 def validate_date(date_text):
     try:
-        # We return the actual datetime object if it's valid
         return datetime.strptime(date_text, '%Y-%m-%d')
     except ValueError:
         print("Incorrect format, should be YYYY-MM-DD")
-        return None # Return None instead of False
+        return None
 
 while True:
     raw_input = input("Enter date (YYYY-MM-DD): ")
     date_obj = validate_date(raw_input)
-
-    if date_obj: # If it's not None, the date is valid
+    if date_obj:
         break
 
+# Format for theDate (Standard ISO)
 theDate = date_obj.strftime("%Y-%m-%d")
-folder_str = date_obj.strftime("%B-%d-%Y").lower()
 
-print(theDate)
-print(folder_str)
+# Format for folder_str (No leading zero on day)
+# We use .day to get the integer value 1 instead of "01"
+folder_str = f"{date_obj.strftime('%B')}-{date_obj.day}-{date_obj.year}".lower()
+
+print(theDate)    # Output: 2026-05-01
+print(folder_str) # Output: may-1-2026
+
+
 
 script_location = Path(__file__).resolve().parent
 BASE_DIR = script_location / "Data" / theDate 
@@ -85,7 +91,7 @@ for loc in cities :
         
 
 df = pd.DataFrame(each_market_data)
-
+    
 
 df.to_csv(file_dir, index=False)
 
