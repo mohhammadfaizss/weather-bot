@@ -1,7 +1,10 @@
 pandas
 numpy
 requests
-scikit-learn 
+scikit-learn
 scipy
 pytz
 boto3
+requests-cache
+retry-requests
+openmeteo-requests

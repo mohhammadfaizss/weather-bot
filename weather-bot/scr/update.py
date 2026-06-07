@@ -22,8 +22,8 @@ script_location = Path(__file__).resolve().parent.parent
 BASE_DIR = script_location / "Data"
 
 metar_data_url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-historical_forcast_url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-max_metar_url = "https://mesonet.agron.iastate.edu/cgi-bin/request/daily.py"
+
+
 
 
 today = date.today()
@@ -92,10 +92,6 @@ class UpdateMosDatabase:
     FORECAST_DIR    = BASE_DIR / "forcast_data"
     API_URL         = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
-    cache_session  = requests_cache.CachedSession('.cache', expire_after=3600)
-    retry_session  = retry(cache_session, retries=5, backoff_factor=0.2)
-    openmeteo      = openmeteo_requests.Client(session=retry_session)
-
 
     def __init__(self, start_date: str = None, end_date: str = None):
         """
@@ -107,6 +103,11 @@ class UpdateMosDatabase:
         today = today.isoformat()
         self.start_date  = start_date or today
         self.end_date    = end_date   or today
+
+        cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
+        retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+        self.openmeteo = openmeteo_requests.Client(session=retry_session)
+
 
     def previous_day1_variables(self):
         return [f"{v}_previous_day1" for v in self.BASE_VARIABLES]
@@ -306,10 +307,10 @@ def gettingcity(city):
     today = date.today()
 
     script_location = Path(__file__).resolve().parent.parent
-    filelocation = BASE_DIR /"forcast_data" / f"historical_{city["name"]}.csv"
+    filelocation = BASE_DIR /"forcast_data" / f"historical_{city['name']}.csv"
     file = pd.read_csv(filelocation)
 
-    metarlocation = BASE_DIR /"metar_data" / f"{city["station"]}.csv"
+    metarlocation = BASE_DIR /"metar_data" / f"{city['station']}.csv"
     metar_file = pd.read_csv(metarlocation)
     metar_last_date = pd.to_datetime(metar_file['valid']).dt.normalize().iloc[-1].date()
 
