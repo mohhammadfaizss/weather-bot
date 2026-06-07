@@ -1,0 +1,83 @@
+cities = [
+    {"name": "beijing", "station": "ZBAA", "timezone": "Asia/Shanghai", "lat": 40.0801, "lon": 116.5846, "network": "CN__ASOS"},
+    {"name": "london", "station": "EGLC", "timezone": "Europe/London", "lat": 51.5085, "lon": -0.1257, "network": "GB__ASOS"},
+    {"name": "tokyo", "station": "RJTT", "timezone": "Asia/Tokyo", "lat": 35.6895, "lon": 139.6917, "network": "JP__ASOS"},
+    {"name": "lucknow", "station": "VILK", "timezone": "Asia/Kolkata", "lat": 26.74, "lon": 80.86, "network": "IN__ASOS"},
+    {"name": "mexico-city", "station": "MMMX", "timezone": "America/Mexico_City", "lat": 19.44, "lon": -99.08, "network": "MX__ASOS"},
+    {"name": "nyc", "station": "LGA", "timezone": "America/New_York", "lat": 40.76, "lon": -73.86, "network": "NY_ASOS"},
+    {"name": "toronto", "station": "CYYZ", "timezone": "America/Toronto", "lat": 43.71, "lon": -79.66, "network": "CA_ON_ASOS"},
+    {"name": "chicago", "station": "ORD", "timezone": "America/Chicago", "lat": 41.98, "lon": -87.91, "network": "IL_ASOS"},
+    {"name": "atlanta", "station": "ATL", "timezone": "America/New_York", "lat": 33.64, "lon": -84.41, "network": "GA_ASOS"},
+    {"name": "dallas", "station": "DAL", "timezone": "America/Chicago", "lat": 32.85, "lon": -96.87, "network": "TX_ASOS"},
+    {"name": "denver", "station": "BKF", "timezone": "America/Denver", "lat": 39.7, "lon": -104.76, "network": "CO_ASOS"},
+    {"name": "san-francisco", "station": "SFO", "timezone": "America/Los_Angeles", "lat": 37.62, "lon": -122.39, "network": "CA_ASOS"},
+    {"name": "houston", "station": "HOU", "timezone": "America/Chicago", "lat": 29.63, "lon": -95.25, "network": "TX_ASOS"},
+    {"name": "miami", "station": "MIA", "timezone": "America/New_York", "lat": 25.85, "lon": -80.24, "network": "FL_ASOS"},
+    {"name": "los-angeles", "station": "LAX", "timezone": "America/Los_Angeles", "lat": 33.96, "lon": -118.4, "network": "CA_ASOS"},
+    {"name": "austin", "station": "AUS", "timezone": "America/Chicago", "lat": 30.16, "lon": -97.69, "network": "TX_ASOS"},
+    {"name": "seattle", "station": "SEA", "timezone": "America/Los_Angeles", "lat": 47.44, "lon": -122.3, "network": "WA_ASOS"},
+    {"name": "panama-city", "station": "MPMG", "timezone": "America/Panama", "lat": 8.98, "lon": 79.56, "network": "PA__ASOS"},
+    {"name": "sao-paulo", "station": "SBGR", "timezone": "America/Sao_Paulo", "lat": -23.42, "lon": -46.48, "network": "BR__ASOS"},
+    {"name": "buenos-aires", "station": "SAEZ", "timezone": "America/Argentina/Buenos_Aires", "lat": -34.79, "lon": -58.52, "network": "AR__ASOS"},
+    {"name": "wellington", "station": "NZWN", "timezone": "Pacific/Auckland", "lat": -41.32, "lon": 174.8, "network": "NF__ASOS"},
+    {"name": "jakarta", "station": "WIHH", "timezone": "Asia/Jakarta", "lat": -6.26, "lon": 106.89, "network": "ID__ASOS"},
+    {"name": "seoul", "station": "RKSI", "timezone": "Asia/Seoul", "lat": 37.49, "lon": 126.49, "network": "KR__ASOS"},
+    {"name": "singapore", "station": "WSSS", "timezone": "Asia/Singapore", "lat": 1.35, "lon": 104, "network": "SG__ASOS"},
+    {"name": "hong-kong", "station": "VHHH", "timezone": "Asia/Hong_Kong", "lat": 22.2783, "lon": 114.1747, "network": "HK__ASOS"},
+    {"name": "shanghai", "station": "ZSPD", "timezone": "Asia/Shanghai", "lat": 31.15, "lon": 121.8, "network": "CN__ASOS"},
+    {"name": "taipei", "station": "RCSS", "timezone": "Asia/Taipei", "lat": 25.06, "lon": 121.55, "network": "TW__ASOS"},
+    {"name": "kuala-lumpur", "station": "WMKK", "timezone": "Asia/Kuala_Lumpur", "lat": 2.77, "lon": 101.7, "network": "MY__ASOS"},
+    {"name": "chongqing", "station": "ZUCK", "timezone": "Asia/Shanghai", "lat": 29.72, "lon": 106.63, "network": "CN__ASOS"},
+    {"name": "chengdu", "station": "ZUUU", "timezone": "Asia/Shanghai", "lat": 30.57, "lon": 103.96, "network": "CN__ASOS"},
+    {"name": "busan", "station": "RKPK", "timezone": "Asia/Seoul", "lat": 35.18, "lon": 128.95, "network": "KR__ASOS"},
+    {"name": "cape-town", "station": "FACT", "timezone": "Africa/Johannesburg", "lat": -33.97, "lon": 18.59, "network": "ZA__ASOS"},
+    {"name": "lagos", "station": "DNMM", "timezone": "Africa/Lagos", "lat": 6.45, "lon": 3.39, "network": "NG__ASOS"},
+    {"name": "jeddah", "station": "OEJN", "timezone": "Asia/Riyadh", "lat": 21.58, "lon": 39.16, "network": "SA__ASOS"},
+    {"name": "tel-aviv", "station": "LLBG", "timezone": "Asia/Jerusalem", "lat": 32.0809, "lon": 34.7806, "network": "IL__ASOS"},
+    {"name": "munich", "station": "EDDM", "timezone": "Europe/Berlin", "lat": 48.35, "lon": 11.79, "network": "DE__ASOS"},
+    {"name": "paris", "station": "LFPB", "timezone": "Europe/Paris", "lat": 49.02, "lon": 2.59, "network": "FR__ASOS"},
+    {"name": "ankara", "station": "LTAC", "timezone": "Europe/Istanbul", "lat": 40.24, "lon": 33.03, "network": "TR__ASOS"},
+    {"name": "istanbul", "station": "LTFM", "timezone": "Europe/Istanbul", "lat": 41.0138, "lon": 28.9497, "network": "TR__ASOS"},
+    {"name": "moscow", "station": "UUEE", "timezone": "Europe/Moscow", "lat": 55.7522, "lon": 37.6156, "network": "RU__ASOS"},
+    {"name": "madrid", "station": "LEMD", "timezone": "Europe/Madrid", "lat": 40.45, "lon": -3.58, "network": "ES__ASOS"},
+    {"name": "helsinki", "station": "EFHK", "timezone": "Europe/Helsinki", "lat": 60.32, "lon": 24.97, "network": "FI__ASOS"},
+    {"name": "amsterdam", "station": "EHAM", "timezone": "Europe/Amsterdam", "lat": 52.31, "lon": 4.76, "network": "NL__ASOS"},
+    {"name": "warsaw", "station": "EPWA", "timezone": "Europe/Warsaw", "lat": 52.17, "lon": 20.98, "network": "PL__ASOS"},  
+    {"name": "milan", "station": "LIMC", "timezone": "Europe/Rome", "lat": 45.63, "lon": 8.7, "network": "IT__ASOS"}
+]
+
+MODELS = [
+    "ecmwf_ifs",
+    "ecmwf_ifs025",
+    "gem_seamless",
+    "gfs_seamless",
+    "icon_seamless",
+    "ukmo_seamless",
+]
+
+SKY_MAP = {"NSC": 0, "FEW": 20, "SCT": 45, "BKN": 75, "OVC": 100 , "NCD": 0}
+
+# American timezone prefixes — markets for these cities use Fahrenheit
+_US_TIMEZONES = {
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Phoenix",
+    "America/Anchorage",
+    "America/Honolulu",
+    "US/Eastern",
+    "US/Central",
+    "US/Mountain",
+    "US/Pacific",
+    "Pacific/Honolulu",
+}
+
+def is_fahrenheit_city(timezone: str) -> bool:
+    """Return True ONLY for US cities whose market buckets are in Fahrenheit."""
+    return timezone in _US_TIMEZONES
+
+
+def c_to_f(c: float) -> int:
+    """Convert Celsius to Fahrenheit and round to nearest integer."""
+    return round(c * 9 / 5 + 32)

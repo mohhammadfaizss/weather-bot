@@ -6,5 +6,3 @@ __pycache__/
 *.cache.sqlite
 *.json
 *.log
-mos_pipeline_v4.py
-mos_pipeline_v3_single_stage.py
