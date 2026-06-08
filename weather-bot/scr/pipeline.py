@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 from corrector import load_corrector, save_corrector
-from data import (load_metar, load_model_forecasts, clean_metar, clean_model, daily_metar, daily_model, pair, load_market_data)
+from data import (load_metar, load_model_forecasts, clean_metar, clean_model, daily_metar, daily_model, pair)
 from features import build_features, feature_cols, safe_fillna
 from model import (walk_forward_validate, cross_validate, train_final, seed_corrector, predict_row)
 from forecast import (make_forecast, get_target_date)
@@ -46,11 +46,7 @@ def run_pipeline(
     initial_train_days   : Min days before first walk-forward prediction
     run_walk_forward     : Full multi-year walk-forward (slow). False = just seed.
     corrector_seed_days  : How many recent days to use for seeding the corrector.
-
-    Buckets and market prices are loaded automatically from:
-        <data_folder>/data/<tomorrow_local_date>/market-<date>.csv
-    No need to pass them manually.
-    """
+        """
 
     import traceback, sys
     _orig = sys.stdout
@@ -69,9 +65,7 @@ def run_pipeline(
 
 
 
-    try: pytz.timezone(timezone)
-    except pytz.exceptions.UnknownTimeZoneError:
-        raise ValueError(f"Unknown timezone '{timezone}'")
+
 
     import sys
     log_dir = Path(data_folder) / "logs" / city
@@ -136,16 +130,7 @@ def run_pipeline(
     print("\n[5c] FINAL MODEL")
     model, scaler, use_sc, fill_v, fc = train_final(fd)
 
-    # -----------------------------------------------------------------------
-    # [5d] CORRECTOR — load persisted real errors OR seed from walk-forward
-    #
-    # The corrector must track errors from the ACTUAL issued forecasts, not
-    # from throwaway mini-models. Each run saves its state; the next run loads
-    # it so the corrector accumulates genuine day-by-day operational errors.
-    #
-    # First run ever (no saved state): fall back to walk-forward seeding so
-    # the corrector has something reasonable to start with.
-    # -----------------------------------------------------------------------
+    
     print(f"\n[5d] CORRECTOR")
     corrector = load_corrector(city, data_folder,
                                decay=corrector_decay,
@@ -168,15 +153,6 @@ def run_pipeline(
         pall  = model.predict(scaler.transform(Xall) if use_sc else Xall)
         err_series = pd.Series(fd["tmax_actual"].values - pall)
 
-    # -----------------------------------------------------------------------
-    # Step 6 & 7 – load market data, forecast, bet recommendations
-    # The local tomorrow date drives:
-    #   a) the section header  b) the market CSV path
-    # We use local time (not UTC) because the pipeline skips the last partial
-    # METAR day and some cities are still on "today" in UTC at run time.
-    # -----------------------------------------------------------------------
-    # Derive target date from the last paired training row, not the system clock.
-    # fd["date"] is already in local time (daily_metar/daily_model convert it).
     target_date = get_target_date(fd)
 
     # Fall back to simulation only when the market file is genuinely absent
@@ -208,46 +184,6 @@ def run_pipeline(
     print(f"  95% CI               : {pred['ci_95'][0]}C – {pred['ci_95'][1]}C")
 
 
-
-    # print(f"\n[8] BET RECOMMENDATION  ({target_date})")
-    # # bucket_probs works in Celsius — buckets are already in C (load_market_data
-    # # converts F->C for American cities so everything here is always Celsius)
-    # probs = bucket_probs(pred["final_forecast"], pred["error_std"], buckets)
-
-    # print(f"\n  {'Bucket':<6} {'ML%':>7}  {'Market%':>8}  {'Edge':>7}  Action")
-    # print("  " + "-" * 46)
-    # for b in buckets:
-    #     mp   = probs.get(b, 0)
-    #     mkt  = market_prices.get(b, 0)
-    #     e    = mp - mkt
-    #     flag = "  BET" if abs(e) >= 0.05 else ""
-    #     print(f"  {b}C     {mp:>6.1%}   {mkt:>6.1%}   {e:>+6.1%}{flag}")
-
-    # bets = bet_recs(probs, market_prices)
-    # if bets:
-    #     print("\n  Recommended bets:")
-    #     for bt in bets:
-    #         print(f"    {bt['action']} {bt['bucket']}C  "
-    #               f"edge={bt['edge']}  kelly={bt['kelly']}  {bt['confidence']}")
-    # else:
-    #     print("\n  No bets above edge threshold.")
-
-    # Save corrector state so the next run has a starting point.
-    # IMPORTANT: this saves the pre-forecast state — the corrector does NOT yet
-    # know today's actual tmax. After the real tmax is observed, you MUST call:
-    #
-    #   update_and_save_corrector(
-    #       result["corrector"],
-    #       forecast_date = target_date,
-    #       ml_prediction = result["forecast"]["ml_forecast"],
-    #       actual_tmax   = <observed tmax>,
-    #       city          = city,
-    #       data_folder   = data_folder,
-    #   )
-    #
-    # Without this call the corrector never accumulates real operational errors
-    # and will keep re-seeding from mini-models on every run.
-    # save_corrector(corrector, city, data_folder)
     print(f"today's actual tmax for {target_date} is observed.")
 
     print("\n" + "=" * 65)
@@ -266,27 +202,3 @@ def run_pipeline(
             "target_date": target_date}
 
 
-# if __name__ == "__main__":
-
-#     all_city_names = [c["name"] for c in cities]
-
-#     city_name = sys.argv[1]
-#     while True:
-#         # city_name = input("Enter city name: ").strip().lower()
-#         selected_city = next((c for c in cities if c["name"] == city_name), None)
-#         if city_name in all_city_names:
-#             print(f"{city_name} found!")
-#             break
-#         else:
-#             print("City not found. Please try again.")
-#             city_name = input("Enter city name: ").strip().lower()
-
-#         result = run_pipeline(
-#         station             = selected_city["station"],
-#         city                = selected_city["name"],
-#         timezone            = selected_city["timezone"],
-#         data_folder         = "mos_data",
-#         initial_train_days  = 1400,
-#         run_walk_forward    = False,   # set True for full diagnostic (slow)
-#         corrector_seed_days = 30,      # increase to 30 for more stable seeding
-#     )

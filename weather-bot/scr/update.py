@@ -89,7 +89,7 @@ class UpdateMosDatabase:
 
     script_location = Path(__file__).resolve().parent.parent
     BASE_DIR = script_location / "Data"
-    FORECAST_DIR    = BASE_DIR / "forcast_data"
+    FORECAST_DIR    = BASE_DIR / "forecast_data"
     API_URL         = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
 
@@ -307,7 +307,7 @@ def gettingcity(city):
     today = date.today()
 
     script_location = Path(__file__).resolve().parent.parent
-    filelocation = BASE_DIR /"forcast_data" / f"historical_{city['name']}.csv"
+    filelocation = BASE_DIR /"forecast_data" / f"historical_{city['name']}.csv"
     file = pd.read_csv(filelocation)
 
     metarlocation = BASE_DIR /"metar_data" / f"{city['station']}.csv"

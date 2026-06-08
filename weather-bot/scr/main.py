@@ -11,9 +11,7 @@ if __name__ == "__main__":
     all_city_names = [c["name"] for c in cities]
 
     city_name = sys.argv[1]
-    # selected_city = next((c for c in cities if c["name"] == city_name), None)
     while True:
-        # city_name = input("Enter city name: ").strip().lower()
         city = next((c for c in cities if c["name"] == city_name), None)
         if city_name in all_city_names:
             print(f"{city_name} found!")
@@ -35,5 +33,5 @@ if __name__ == "__main__":
         data_folder         = str( BASE_DIR /"Data"),
         initial_train_days  = 1400,
         run_walk_forward    = False,   # set True for full diagnostic (slow)
-        corrector_seed_days = 30,      # increase to 30 for more stable seeding
+        corrector_seed_days = 30,      # Recommended is 30 for more stable seeding
         )

@@ -103,6 +103,7 @@ def make_forecast(model, scaler, use_scaling, fill_values, fc,
     mean_30d = float(actuals.iloc[-30:].mean()) if len(actuals) >= 10 else mean_7d
     row["tmax_7day_anomaly"] = mean_7d - mean_30d
 
+
     # ── B) Rolling bias, anomaly, moisture-trend features ─────────────────────
     # These are all computed from historical rows in fd — tomorrow has no actual
     # yet so we carry today's computed values forward unchanged.
@@ -111,10 +112,12 @@ def make_forecast(model, scaler, use_scaling, fill_values, fc,
     carry_exact    = {"forecast_anomaly", "obs_dewpoint_depression_lag1",
                       "heat_island_signal_lag1"}
     for col in fc:
-        is_carry = (any(col.startswith(p) for p in carry_prefixes)
-                    or col in carry_exact)
-        if is_carry and col in today.index and pd.notna(today[col]):
-            row[col] = today[col]
+        is_carry = (any(col.startswith(p) for p in carry_prefixes) or col in carry_exact)
+        if is_carry:
+            if col in today.index and pd.notna(today[col]):
+                row[col] = today[col]
+            else:
+                row[col] = 0.0  # safe fallback — these are mean-centred anomalies
 
     # obs_dewpoint_depression_lag1: carry today's observed depression
     # (it's already lag-1 relative to tomorrow — perfect as-is)
@@ -190,29 +193,3 @@ def make_forecast(model, scaler, use_scaling, fill_values, fc,
         "ci_80": (round(final - 1.28*es, 1), round(final + 1.28*es, 1)),
         "ci_95": (round(final - 1.96*es, 1), round(final + 1.96*es, 1)),
     }
-# def bucket_probs(forecast, error_std, buckets):
-
-#     probs = {}
-#     for i, b in enumerate(buckets):
-#         if   b == buckets[0]:  p = norm.cdf((buckets[i+1]+b)/2, forecast, error_std)
-#         elif b == buckets[-1]: p = 1 - norm.cdf((b+buckets[i-1])/2, forecast, error_std)
-#         else:
-#             lo = (b+buckets[i-1])/2; hi = (buckets[i+1]+b)/2
-#             p  = norm.cdf(hi, forecast, error_std) - norm.cdf(lo, forecast, error_std)
-#         probs[b] = round(float(p), 4)
-#     return probs
-
-# def bet_recs(ml_probs, market_prices, min_edge=0.05):
-#     recs = []
-#     for b, mp in ml_probs.items():
-#         if b not in market_prices: continue
-#         mkt  = market_prices[b]; edge = mp - mkt
-#         if abs(edge) >= min_edge:
-#             kelly = edge/(1-mkt) if edge>0 else edge/mkt
-#             recs.append({"bucket": b, "ml_prob": f"{mp:.1%}",
-#                          "market_price": f"{mkt:.1%}", "edge": f"{edge:+.1%}",
-#                          "kelly": f"{kelly:.3f}",
-#                          "action": "BET YES" if edge>0 else "BET NO",
-#                          "confidence": "HIGH" if abs(edge)>0.10 else "MEDIUM"})
-#     recs.sort(key=lambda x: abs(float(x["edge"].replace("%",""))/100), reverse=True)
-#     return recs

@@ -1,6 +1,6 @@
 # Weather Forecast Pipeline
 
-A production-style machine learning pipeline that generates daily maximum temperature forecasts for 45 cities worldwide. The system ingests real-time METAR observations and NWP ensemble model data, trains a gradient boosting model, applies a real-time bias corrector, and outputs probabilistic forecasts with confidence intervals and bet recommendations for weather derivative markets.
+A production-style pipeline that generates daily maximum temperature forecasts for 45 cities worldwide. The system ingests real-time METAR observations and NWP ensemble model data, trains a gradient boosting model, applies a real-time bias corrector, and outputs probabilistic forecasts with confidence intervals.
 
 ---
 
@@ -14,8 +14,6 @@ Given a city name, the pipeline:
 4. Seeds a real-time exponential bias corrector from out-of-sample walk-forward errors
 5. Builds a synthetic forecast row for tomorrow using tomorrow's NWP data and today's observed lags
 6. Outputs a final temperature forecast with 80% and 95% confidence intervals
-7. Computes bucket probabilities and Kelly criterion bet recommendations against market prices
-
 ---
 
 ## Project Structure
@@ -34,7 +32,7 @@ weather-bot/
     ├── data.py              # Data loading, cleaning, alignment
     ├── features.py          # Feature engineering
     ├── model.py             # Model training, walk-forward validation, cross-validation
-    ├── forecast.py          # Forecast generation, bucket probabilities, bet recommendations
+    ├── forecast.py          # Forecast generation
     ├── corrector.py         # Real-time bias corrector with exponential decay
     ├── update.py            # Data updater — fetches latest METAR and NWP data
     ├── download_data.py     # Downloads historical data from S3
@@ -58,8 +56,7 @@ NWP CSVs ────┘                                                    │
                                                                   ▼
                                                      Final Forecast + CI
                                                                   │
-                                                                  ▼
-                                                    Bucket Probs + Bets
+                                                                  
 ```
 
 ---
@@ -96,7 +93,7 @@ The corrector sits on top of the ML model and captures regime-dependent errors t
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/faizssmohammad/weather-bot
+git clone https://github.com/mohhammadfaizss/weather-bot
 cd weather-bot
 ```
 
@@ -166,17 +163,11 @@ The updater runs automatically before the pipeline — it checks the last date i
   80% CI               : 17.9C – 21.7C
   95% CI               : 16.9C – 22.7C
 
-[8] BET RECOMMENDATION
-  Bucket   ML%     Market%    Edge    Action
-  19C      18.4%   13.1%     +5.3%   BET
-  20C      21.2%   27.8%     -6.6%   BET NO
-```
-
 ---
 
 ## Tech Stack
 
-- **Python 3.11**
+- **Python 3.12**
 - **pandas / numpy** — data processing
 - **scikit-learn** — GradientBoostingRegressor, Ridge, StandardScaler
 - **scipy** — normal distribution for probabilistic bucket forecasts

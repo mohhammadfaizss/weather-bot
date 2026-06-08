@@ -249,4 +249,3 @@ def update_and_save_corrector(corrector: RealtimeBiasCorrector,
     print(f"  [CORRECTOR] Updated with real error for {forecast_date}: "
           f"predicted={ml_prediction:.1f}C  actual={actual_tmax:.1f}C  "
           f"error={error:+.1f}C")
-    # save_corrector(corrector, city, data_folder)

@@ -26,7 +26,7 @@ def load_metar(station: str, data_folder: str = "Data") -> pd.DataFrame:
 
 def load_model_forecasts(city: str, data_folder: str = "Data") -> pd.DataFrame:
     data_folder = Path(data_folder)
-    file_path = data_folder / "forcast_data"
+    file_path = data_folder / "forecast_data"
 
     p1 = Path(file_path) / f"historical_{city}.csv"
     p2 = Path(file_path) / "historical.csv"
@@ -87,104 +87,6 @@ def load_model_forecasts(city: str, data_folder: str = "Data") -> pd.DataFrame:
         df["ens_wind_v"] = pd.concat(v_parts, axis=1).mean(axis=1)
 
     return df.sort_values("date").reset_index(drop=True)
-
-def load_market_data(city: str, timezone: str,
-                     target_date: str,
-                     data_folder: str = "Data") -> tuple:
-    """
-    Load buckets AND market prices from  data/<date>/market-<date>.csv
-
-    Parameters
-    ----------
-    city        : city name matching the CSV "city" column (case-insensitive)
-    timezone    : IANA timezone — used only for Fahrenheit city detection
-    target_date : "YYYY-MM-DD" of the day being predicted. Must be derived from
-                  the last paired training date + 1 day, NOT the system clock.
-    data_folder : root data folder (resolved relative to this script)
-
-    Returns
-    -------
-    (buckets, market_prices)
-    buckets       : sorted list of ints in CELSIUS
-    market_prices : dict {int_celsius_bucket: float_YES_price}
-    On any failure returns (None, None).
-
-    Title parsing
-    -------------
-    "19°C or below" -> 19,  "21°C" -> 21,  "29°C or higher" -> 29
-    American cities: CSV titles in °F, converted back to °C internally.
-
-    Path resolution
-    ---------------
-    Always relative to this script's own directory.
-    """
-    import re
-    import ast
-
-    script_dir   = Path(__file__).resolve().parent.parent
-    data_dir     = script_dir /  "data" / target_date
-    csv_path     = data_dir / f"market-{target_date}.csv"
-
-    # --- Existence checks with clear error messages ---
-    if not data_dir.exists():
-        print(f"  [MARKET] Folder not found: {data_dir}  — will simulate prices.")
-        return None, None
-
-    if not csv_path.exists():
-        print(f"  [MARKET] File not found: {csv_path}  — will simulate prices.")
-        return None, None
-
-    df = pd.read_csv(csv_path)
-
-    # Filter to this city (case-insensitive)
-    city_df = df[df["city"].str.lower() == city.lower()].copy()
-    if len(city_df) == 0:
-        print(f"  [MARKET] City '{city}' not found in {csv_path.name}  — will simulate.")
-        return None, None
-
-    fahrenheit = is_fahrenheit_city(timezone)
-    prices_c   = {}   # all keys stored in Celsius
-
-    for _, row in city_df.iterrows():
-        title = str(row["title"])
-
-        # --- Parse YES price (first element of the JSON list) ---
-        try:
-            price_list = ast.literal_eval(row["prices"])
-            yes_price  = float(price_list[0])
-        except Exception:
-            print(f"  [MARKET] Could not parse prices column for row: {title!r} — skipping.")
-            continue
-
-        # --- Parse temperature integer from title ---
-        # Optional leading minus handles negative temps (e.g. "-5°C or below")
-        nums = re.findall(r"-?\d+", title)
-        if not nums:
-            print(f"  [MARKET] No temperature integer found in title: {title!r} — skipping.")
-            continue
-        temp_raw = int(nums[0])
-
-        # --- For American cities: CSV is in °F, convert back to °C ---
-        if fahrenheit:
-            temp_c = round((temp_raw - 32) * 5 / 9)
-        else:
-            temp_c = temp_raw
-
-        prices_c[temp_c] = yes_price
-
-    if not prices_c:
-        print(f"  [MARKET] No valid rows parsed from {csv_path.name}  — will simulate.")
-        return None, None
-
-    # Buckets = sorted Celsius integers (preserves natural ascending order)
-    buckets = sorted(prices_c.keys())
-
-    unit = "°F" if fahrenheit else "°C"
-    print(f"  [MARKET] Loaded {len(buckets)} buckets for '{city}' "
-          f"from {csv_path.name}  (date: {target_date}, market in {unit})")
-    print(f"  [MARKET] Buckets (°C): {buckets}")
-
-    return buckets, prices_c
 
 
 # Cleaning data
@@ -314,11 +216,13 @@ def daily_model(model_df, tz):
 
 
 def pair(metar_d, model_d):
-    # Exclude partial METAR days from training.
-    # daily_metar keeps the most recent partial day so its tmax_actual can
-    # feed the corrector seeder, but a partial day's tmax is unreliable for
-    # training — the day is not over yet. If we leave it in, fd ends one day
-    # later than it should, pushing the target date forward by one.
+    """
+        Exclude partial METAR days from training.
+        daily_metar keeps the most recent partial day so its tmax_actual can
+        feed the corrector seeder, but a partial day's tmax is unreliable for
+        training — the day is not over yet. If we leave it in, fd ends one day
+        later than it should, pushing the target date forward by one.
+    """
     if "is_partial" in metar_d.columns:
         train_metar = metar_d[~metar_d["is_partial"]].copy()
     else:

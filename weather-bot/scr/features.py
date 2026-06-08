@@ -247,4 +247,3 @@ def feature_cols(df: pd.DataFrame) -> list:
             c.append(col)
 
     return c
-
