@@ -181,3 +181,4 @@ The updater runs automatically before the pipeline — it checks the last date i
 
 - **METAR observations** — Iowa Environmental Mesonet (IEM) ASOS network
 - **NWP model forecasts** — Open-Meteo API (ECMWF IFS, ECMWF IFS025, GFS Seamless, GEM Seamless, ICON Seamless, UKMO Seamless)
+- **This software will undergo transformation so it could work with the cloud. particularly s3, ec2, IAM and boto3.
